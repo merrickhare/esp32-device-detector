@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+*.bin
+core.bin
+.DS_Store
+# per-board settings (companion MAC etc.)
+detector/include/local_config.h
