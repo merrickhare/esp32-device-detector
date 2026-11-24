@@ -4,4 +4,6 @@
 core.bin
 .DS_Store
 # per-board settings (companion MAC etc.)
-detector/include/local_config.h
+detector/include/local_*.h
+!detector/include/local_config.example.h
+detector/private/

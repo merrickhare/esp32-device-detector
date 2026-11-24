@@ -11,3 +11,8 @@
 // #define BRAND_BOOT_TAG  "LINK ESTABLISHED // SYSTEMS ONLINE"
 // #define BRAND_UNIT      "MK-1"
 // #define BRAND_AP_SSID   "MYCALL-SETUP"
+
+// Custom images (optional): add include/local_boot_img.h defining boot_jpg (240x320 baseline JPEG)
+// and/or include/local_header_img.h defining header_jpg (240x150). Then aim the boot reticle:
+// #define BOOT_RETICLE_X 150
+// #define BOOT_RETICLE_Y 129

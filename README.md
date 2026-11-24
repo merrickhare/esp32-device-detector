@@ -47,6 +47,11 @@ The on-screen name, labels and setup-portal SSID come from `BRAND_*` defaults in
 `detector/include/local_config.h` and set your own; that file is git-ignored, so
 personal branding and your companion MAC never end up in the repo.
 
+Custom images work the same way: add `detector/include/local_boot_img.h` (array
+`boot_jpg`, 240x320 baseline JPEG) and/or `detector/include/local_header_img.h`
+(array `header_jpg`, 240x150). Both are git-ignored; without them the built-in drawn
+art is used.
+
 ## Contributing
 Issues and pull requests welcome. Keep it passive (receive-only) and keep secrets
 and personal settings out of tracked files.

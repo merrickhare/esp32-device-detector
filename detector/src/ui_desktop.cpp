@@ -2,6 +2,35 @@
 #include "ui.h"
 #include "netsync.h"
 #include "mech_sprites.h"
+
+// Optional custom images (git-ignored). Each header defines a baseline JPEG array:
+//   include/local_boot_img.h   -> boot_jpg   (240x320, boot splash)
+//   include/local_header_img.h -> header_jpg (240x150, desktop header)
+// Without them the built-in drawn art is used.
+#if __has_include("local_boot_img.h")
+#include "local_boot_img.h"
+#define HAVE_BOOT_IMG 1
+#endif
+#if __has_include("local_header_img.h")
+#include "local_header_img.h"
+#define HAVE_HEADER_IMG 1
+#endif
+#if defined(HAVE_BOOT_IMG) || defined(HAVE_HEADER_IMG)
+#include <TJpg_Decoder.h>
+static TFT_eSPI* s_jpgTft = nullptr;
+static bool jpgOut(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
+    if (y >= s_jpgTft->height()) return false;
+    s_jpgTft->pushImage(x, y, w, h, bmp);
+    return true;
+}
+static void drawJpg(TFT_eSPI& g, const uint8_t* d, size_t n) {
+    s_jpgTft = &g;
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setSwapBytes(true);
+    TJpgDec.setCallback(jpgOut);
+    TJpgDec.drawJpg(0, 0, d, n);
+}
+#endif
 #include <time.h>
 
 
@@ -167,10 +196,18 @@ static void drawPilotArt(TFT_eSPI& g) {
 void Display::showBoot() {
     _screen = Screen::BOOT;
     _tft.fillScreen(C_BG);
+#ifdef HAVE_BOOT_IMG
+    drawJpg(_tft, boot_jpg, sizeof(boot_jpg));
+#else
     drawPilotArt(_tft);
+#endif
 
     // Targeting reticle locks on over the visor HUD
+#ifdef BOOT_RETICLE_X
+    const int rx = BOOT_RETICLE_X, ry = BOOT_RETICLE_Y;   // set in local_config.h for a custom image
+#else
     const int rx = 120, ry = 135;
+#endif
     for (int a = 30; a <= 360; a += 30) {
         _tft.drawArc(rx, ry, 17, 15, 0, a, C_ZCYAN, C_BG, false);
         delay(18);
@@ -254,7 +291,11 @@ void Display::drawDesktop(bool full) {
     uint32_t t = millis();
     if (full) {
         _tft.fillScreen(C_BG);
+#ifdef HAVE_HEADER_IMG
+        drawJpg(_tft, header_jpg, sizeof(header_jpg));
+#else
         drawHeaderArt(_tft);
+#endif
 
         // HUD corner brackets
         const int L = 14;
