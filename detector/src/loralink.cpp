@@ -4,7 +4,6 @@
 
 LoraLink loraLink;
 
-static const uint8_t COMPANION_MAC[6] = LORA_COMPANION_MAC;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static LoraReport s_box;
 static volatile bool s_full = false;
@@ -15,7 +14,8 @@ static MeshDecoded s_decBox;
 static volatile bool s_decFull = false;
 
 static void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
-    if (memcmp(mac, COMPANION_MAC, 6) != 0) { s_rejected++; return; }
+    // Accept frames from any source with valid protocol magic (companion or infiltrator)
+    if (len < 5) { s_rejected++; return; }
 
     uint32_t magic;
     memcpy(&magic, data, sizeof(magic));
