@@ -8,8 +8,20 @@
 #define LORA_SPECTRUM_BINS  64
 #define LORA_MAX_HITS       8
 
+// Second frame type for decoded Meshtastic data
+#define LORA_DECODED_MAGIC  0x324C4444u   // "DDL2"
+#define LORA_DECODED_VERSION 1
+
 enum LoraBand : uint8_t { BAND_433 = 0, BAND_868 = 1, BAND_915 = 2 };
 enum LoraHitKind : uint8_t { HIT_LORA = 1, HIT_MESHTASTIC = 2 };
+
+// Decoded Meshtastic payload types
+enum MeshPortnum : uint8_t {
+    MESH_PORT_TEXT      = 1,
+    MESH_PORT_POSITION  = 3,
+    MESH_PORT_NODEINFO  = 4,
+    MESH_PORT_TELEMETRY = 67,
+};
 
 struct __attribute__((packed)) LoraHit {
     uint32_t freqKhz;
@@ -42,3 +54,43 @@ struct __attribute__((packed)) LoraReport {
 };
 
 static_assert(sizeof(LoraReport) <= 250, "ESP-NOW payload limit");
+
+// Decoded Meshtastic message — sent as a separate ESP-NOW frame
+struct __attribute__((packed)) MeshDecoded {
+    uint32_t magic;       // LORA_DECODED_MAGIC
+    uint8_t  version;     // LORA_DECODED_VERSION
+    uint8_t  portnum;     // MeshPortnum
+    uint16_t seq;
+    uint32_t from;        // source node ID
+    uint32_t to;          // destination node ID
+    int8_t   rssi;
+    int8_t   snr;
+    uint8_t  hopLimit;
+    uint8_t  channel;     // channel index
+    union __attribute__((packed)) {
+        struct __attribute__((packed)) {
+            int32_t  latI;    // lat * 1e7
+            int32_t  lonI;    // lon * 1e7
+            int32_t  alt;     // meters
+            uint32_t time;    // unix epoch
+            uint32_t satsInView;
+        } pos;
+        struct __attribute__((packed)) {
+            char shortName[5];
+            char longName[40];
+            uint8_t hwModel;
+        } nodeinfo;
+        struct __attribute__((packed)) {
+            char text[100];
+        } text;
+        struct __attribute__((packed)) {
+            uint32_t time;
+            float    battLevel;   // 0-100
+            float    voltage;
+            float    chUtil;      // channel utilization %
+            float    airUtilTx;   // air utilization tx %
+        } telemetry;
+    };
+};
+
+static_assert(sizeof(MeshDecoded) <= 250, "ESP-NOW payload limit");

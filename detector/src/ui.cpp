@@ -869,7 +869,11 @@ void Display::drawHunt(bool full) {
 
     // --- Header: name + live RSSI ---
     if (isLora) {
-        snprintf(buf, sizeof(buf), "MESH !%08lx", (unsigned long)_loraHuntNode);
+        const MeshNodeCache* nc = loraLink.findNode(_loraHuntNode);
+        if (nc && nc->longName[0])
+            snprintf(buf, sizeof(buf), "%s", nc->longName);
+        else
+            snprintf(buf, sizeof(buf), "MESH !%08lx", (unsigned long)_loraHuntNode);
     } else {
         const Detection& d = *detector.at(idx);
         labelFor(d, buf, sizeof(buf));
@@ -897,10 +901,19 @@ void Display::drawHunt(bool full) {
     _tft.fillRect(0, 36, SCREEN_W, 10, C_BG);
     _tft.setTextDatum(MC_DATUM);
     _tft.setTextColor(C_MUTED, C_BG);
-    if (isLora)
-        snprintf(buf, sizeof(buf), "LORA  via companion");
-    else
+    if (isLora) {
+        const MeshNodeCache* nc2 = loraLink.findNode(_loraHuntNode);
+        if (nc2 && nc2->posMs)
+            snprintf(buf, sizeof(buf), "%.5f, %.5f  alt %dm",
+                     nc2->latI / 1e7, nc2->lonI / 1e7, (int)nc2->alt);
+        else if (nc2 && nc2->telemMs)
+            snprintf(buf, sizeof(buf), "batt %.0f%%  %.2fV  ch%.1f%%",
+                     nc2->battLevel, nc2->voltage, nc2->chUtil);
+        else
+            snprintf(buf, sizeof(buf), "!%08lx  LORA via companion", (unsigned long)_loraHuntNode);
+    } else {
         fmtMac(detector.at(idx)->mac, buf);
+    }
     _tft.drawString(buf, 120, 40, 1);
     _tft.setTextDatum(TL_DATUM);
 
@@ -1210,7 +1223,7 @@ void Display::drawLora(bool full) {
         }
     }
 
-    // Recent hits (Meshtastic rows are tappable → hunt)
+    // Recent hits — enrich Meshtastic rows with decoded node names
     for (int i = 0; i < 5; i++) {
         int y = 216 + i * 12;
         if (i >= r.hitCount) {
@@ -1220,8 +1233,13 @@ void Display::drawLora(bool full) {
         const LoraHit& h = r.hits[i];
         fmtAgo(h.ageS * 1000UL, ago, sizeof(ago));
         if (h.kind == HIT_MESHTASTIC) {
-            snprintf(buf, sizeof(buf), "MESH !%08lx %ddBm %s",
-                     (unsigned long)h.nodeId, h.rssi, ago);
+            const MeshNodeCache* nc = loraLink.findNode(h.nodeId);
+            if (nc && nc->shortName[0])
+                snprintf(buf, sizeof(buf), "[%s] %ddBm %s",
+                         nc->shortName, h.rssi, ago);
+            else
+                snprintf(buf, sizeof(buf), "!%08lx %ddBm %s",
+                         (unsigned long)h.nodeId, h.rssi, ago);
             padLine(_tft, buf, y, h.ageS < 60 ? C_FG : C_MUTED);
             _tft.setTextDatum(TR_DATUM);
             _tft.setTextColor(C_ACCENT, C_BG);

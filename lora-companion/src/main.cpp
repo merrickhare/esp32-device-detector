@@ -11,6 +11,8 @@
 #include <esp_wifi.h>
 #include <RadioLib.h>
 #include <U8g2lib.h>
+#include <mbedtls/aes.h>
+#include <mbedtls/sha256.h>
 #include "lora_proto.h"
 
 // --- ttgov21new (LoRa32 V2.1 / v1.6) pin map, confirmed by radio.begin() ---
@@ -69,6 +71,9 @@ static const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static volatile bool s_sendDone = true;
 static portMUX_TYPE s_reportMux = portMUX_INITIALIZER_UNLOCKED;
 static LoraReport s_report = {};
+static MeshDecoded s_decoded = {};
+static volatile bool s_decodedReady = false;
+static portMUX_TYPE s_decodedMux = portMUX_INITIALIZER_UNLOCKED;
 
 static void onSent(const uint8_t*, esp_now_send_status_t) { s_sendDone = true; }
 
@@ -85,13 +90,36 @@ static void broadcastAllChannels(const LoraReport& r) {
 
 // Re-sends the current report ~6x per second. The detector's radio is shared with
 // BLE and hops WiFi channels, so any single copy has only a fair chance of landing.
+static void broadcastDecoded(const MeshDecoded& d) {
+    for (uint8_t ch = 1; ch <= 13; ch++) {
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        s_sendDone = false;
+        if (esp_now_send(BROADCAST, (const uint8_t*)&d, sizeof(d)) != ESP_OK) continue;
+        uint32_t t0 = millis();
+        while (!s_sendDone && millis() - t0 < 20) delay(1);
+    }
+}
+
 static void senderTask(void*) {
     LoraReport r;
+    MeshDecoded d;
     for (;;) {
         portENTER_CRITICAL(&s_reportMux);
         memcpy(&r, &s_report, sizeof(r));
         portEXIT_CRITICAL(&s_reportMux);
         if (r.magic == LORA_PROTO_MAGIC) broadcastAllChannels(r);
+
+        // Send any decoded message waiting
+        bool haveDec = false;
+        portENTER_CRITICAL(&s_decodedMux);
+        if (s_decodedReady) {
+            memcpy(&d, &s_decoded, sizeof(d));
+            s_decodedReady = false;
+            haveDec = true;
+        }
+        portEXIT_CRITICAL(&s_decodedMux);
+        if (haveDec) broadcastDecoded(d);
+
         vTaskDelay(pdMS_TO_TICKS(140 + (esp_random() % 40)));
     }
 }
@@ -176,6 +204,266 @@ static void noteBurst(uint32_t freqKhz, int8_t rssi, uint8_t sf) {
     if (s_loraPackets < 65535) s_loraPackets++;
 }
 
+// ---------------- Meshtastic decrypt + decode ----------------
+
+// Default "LongFast" PSK is {0x01} → expanded via SHA-256 to AES-128 key
+static uint8_t s_meshKey[16];
+static bool s_meshKeyReady = false;
+
+static void initMeshKey() {
+    // Meshtastic expands short PSKs: 1-byte PSK → SHA-256(byte) → first 16 bytes
+    const uint8_t psk[] = {0x01};
+    uint8_t hash[32];
+    mbedtls_sha256(psk, 1, hash, 0);
+    memcpy(s_meshKey, hash, 16);
+    s_meshKeyReady = true;
+    Serial.printf("[MESH] AES key derived from default PSK\n");
+}
+
+// AES-128-CTR decrypt in place. Nonce: packetId(LE32) + fromNode(LE32) + zeros
+static bool meshDecrypt(uint8_t* payload, size_t len, uint32_t packetId, uint32_t fromNode) {
+    if (!s_meshKeyReady || len == 0) return false;
+    uint8_t nonce[16] = {};
+    memcpy(nonce, &packetId, 4);
+    memcpy(nonce + 4, &fromNode, 4);
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, s_meshKey, 128);
+    uint8_t stream[16] = {};
+    size_t nc_off = 0;
+    int r = mbedtls_aes_crypt_ctr(&aes, len, &nc_off, nonce, stream, payload, payload);
+    mbedtls_aes_free(&aes);
+    return r == 0;
+}
+
+// Minimal protobuf varint decoder
+static bool pbVarint(const uint8_t*& p, const uint8_t* end, uint64_t& val) {
+    val = 0;
+    int shift = 0;
+    while (p < end) {
+        uint8_t b = *p++;
+        val |= (uint64_t)(b & 0x7F) << shift;
+        if (!(b & 0x80)) return true;
+        shift += 7;
+        if (shift > 63) return false;
+    }
+    return false;
+}
+
+static bool pbSkip(const uint8_t*& p, const uint8_t* end, uint8_t wireType) {
+    uint64_t v;
+    switch (wireType) {
+        case 0: return pbVarint(p, end, v);
+        case 1: p += 8; return p <= end;
+        case 2: if (!pbVarint(p, end, v)) return false; p += v; return p <= end;
+        case 5: p += 4; return p <= end;
+        default: return false;
+    }
+}
+
+// Parse Meshtastic Data envelope: field 1 = portnum (varint), field 2 = payload (bytes)
+struct DataEnvelope { uint8_t portnum; const uint8_t* payload; size_t payloadLen; };
+
+static bool parseDataEnvelope(const uint8_t* data, size_t len, DataEnvelope& env) {
+    env = {};
+    const uint8_t* p = data;
+    const uint8_t* end = data + len;
+    while (p < end) {
+        uint64_t tag;
+        if (!pbVarint(p, end, tag)) return false;
+        uint8_t field = tag >> 3;
+        uint8_t wt = tag & 7;
+        if (field == 1 && wt == 0) {
+            uint64_t v;
+            if (!pbVarint(p, end, v)) return false;
+            env.portnum = (uint8_t)v;
+        } else if (field == 2 && wt == 2) {
+            uint64_t v;
+            if (!pbVarint(p, end, v)) return false;
+            env.payload = p;
+            env.payloadLen = (size_t)v;
+            p += v;
+        } else {
+            if (!pbSkip(p, end, wt)) return false;
+        }
+    }
+    return env.portnum != 0 && env.payload != nullptr;
+}
+
+// Parse Position protobuf: field 1=latI(sfixed32), 2=lonI(sfixed32), 3=alt(int32), 4=time, 9=satsInView
+static void parsePosition(const uint8_t* data, size_t len, MeshDecoded& d) {
+    const uint8_t* p = data;
+    const uint8_t* end = data + len;
+    while (p < end) {
+        uint64_t tag;
+        if (!pbVarint(p, end, tag)) return;
+        uint8_t field = tag >> 3;
+        uint8_t wt = tag & 7;
+        if (field == 1 && wt == 5 && p + 4 <= end) {
+            memcpy(&d.pos.latI, p, 4); p += 4;
+        } else if (field == 2 && wt == 5 && p + 4 <= end) {
+            memcpy(&d.pos.lonI, p, 4); p += 4;
+        } else if (field == 3 && wt == 0) {
+            uint64_t v; if (!pbVarint(p, end, v)) return;
+            d.pos.alt = (int32_t)v;
+        } else if (field == 4 && wt == 5 && p + 4 <= end) {
+            memcpy(&d.pos.time, p, 4); p += 4;
+        } else if (field == 9 && wt == 0) {
+            uint64_t v; if (!pbVarint(p, end, v)) return;
+            d.pos.satsInView = (uint32_t)v;
+        } else {
+            if (!pbSkip(p, end, wt)) return;
+        }
+    }
+}
+
+// Parse NodeInfo (User) protobuf: field 1=id(string), 2=longName, 3=shortName, 4=hwModel
+static void parseNodeInfo(const uint8_t* data, size_t len, MeshDecoded& d) {
+    const uint8_t* p = data;
+    const uint8_t* end = data + len;
+    while (p < end) {
+        uint64_t tag;
+        if (!pbVarint(p, end, tag)) return;
+        uint8_t field = tag >> 3;
+        uint8_t wt = tag & 7;
+        if (field == 2 && wt == 2) {
+            uint64_t slen; if (!pbVarint(p, end, slen)) return;
+            size_t n = slen < sizeof(d.nodeinfo.longName) - 1 ? (size_t)slen : sizeof(d.nodeinfo.longName) - 1;
+            memcpy(d.nodeinfo.longName, p, n);
+            d.nodeinfo.longName[n] = 0;
+            p += slen;
+        } else if (field == 3 && wt == 2) {
+            uint64_t slen; if (!pbVarint(p, end, slen)) return;
+            size_t n = slen < sizeof(d.nodeinfo.shortName) - 1 ? (size_t)slen : sizeof(d.nodeinfo.shortName) - 1;
+            memcpy(d.nodeinfo.shortName, p, n);
+            d.nodeinfo.shortName[n] = 0;
+            p += slen;
+        } else if (field == 4 && wt == 0) {
+            uint64_t v; if (!pbVarint(p, end, v)) return;
+            d.nodeinfo.hwModel = (uint8_t)v;
+        } else {
+            if (!pbSkip(p, end, wt)) return;
+        }
+    }
+}
+
+// Parse DeviceMetrics inside Telemetry: field 1=battLevel, 2=voltage, 3=chUtil, 4=airUtilTx
+static void parseTelemetry(const uint8_t* data, size_t len, MeshDecoded& d) {
+    const uint8_t* p = data;
+    const uint8_t* end = data + len;
+    while (p < end) {
+        uint64_t tag;
+        if (!pbVarint(p, end, tag)) return;
+        uint8_t field = tag >> 3;
+        uint8_t wt = tag & 7;
+        // Telemetry has field 1=time(fixed32), field 2=device_metrics(submessage)
+        if (field == 1 && wt == 5 && p + 4 <= end) {
+            memcpy(&d.telemetry.time, p, 4); p += 4;
+        } else if (field == 2 && wt == 2) {
+            // device_metrics submessage
+            uint64_t slen; if (!pbVarint(p, end, slen)) return;
+            const uint8_t* sub = p;
+            const uint8_t* subEnd = p + slen;
+            p += slen;
+            while (sub < subEnd) {
+                uint64_t stag;
+                if (!pbVarint(sub, subEnd, stag)) return;
+                uint8_t sf2 = stag >> 3;
+                uint8_t sw = stag & 7;
+                if (sf2 == 1 && sw == 0) {
+                    uint64_t v; if (!pbVarint(sub, subEnd, v)) return;
+                    d.telemetry.battLevel = (float)v;
+                } else if (sf2 == 2 && sw == 5 && sub + 4 <= subEnd) {
+                    memcpy(&d.telemetry.voltage, sub, 4); sub += 4;
+                } else if (sf2 == 3 && sw == 5 && sub + 4 <= subEnd) {
+                    memcpy(&d.telemetry.chUtil, sub, 4); sub += 4;
+                } else if (sf2 == 4 && sw == 5 && sub + 4 <= subEnd) {
+                    memcpy(&d.telemetry.airUtilTx, sub, 4); sub += 4;
+                } else {
+                    if (!pbSkip(sub, subEnd, sw)) return;
+                }
+            }
+        } else {
+            if (!pbSkip(p, end, wt)) return;
+        }
+    }
+}
+
+static void publishDecoded(const MeshDecoded& d) {
+    portENTER_CRITICAL(&s_decodedMux);
+    memcpy(&s_decoded, &d, sizeof(d));
+    s_decodedReady = true;
+    portEXIT_CRITICAL(&s_decodedMux);
+}
+
+static void tryDecode(const uint8_t* raw, size_t rawLen, int8_t rssi, int8_t snr) {
+    if (rawLen < MESH_HDR_LEN + 1) return;
+
+    // Parse header
+    uint32_t to2   = raw[0] | (raw[1] << 8) | (raw[2] << 16) | ((uint32_t)raw[3] << 24);
+    uint32_t from2 = raw[4] | (raw[5] << 8) | (raw[6] << 16) | ((uint32_t)raw[7] << 24);
+    uint32_t id    = raw[8] | (raw[9] << 8) | (raw[10] << 16) | ((uint32_t)raw[11] << 24);
+    uint8_t flags  = raw[12];
+    uint8_t chIdx  = raw[13];
+
+    // Encrypted payload starts after the 16-byte header
+    size_t payLen = rawLen - MESH_HDR_LEN;
+    if (payLen > 240) return;
+    uint8_t dec[240];
+    memcpy(dec, raw + MESH_HDR_LEN, payLen);
+
+    if (!meshDecrypt(dec, payLen, id, from2)) return;
+
+    // Parse the Data protobuf envelope
+    DataEnvelope env;
+    if (!parseDataEnvelope(dec, payLen, env)) return;
+
+    MeshDecoded d = {};
+    d.magic = LORA_DECODED_MAGIC;
+    d.version = LORA_DECODED_VERSION;
+    d.portnum = env.portnum;
+    d.from = from2;
+    d.to = to2;
+    d.rssi = rssi;
+    d.snr = snr;
+    d.hopLimit = flags & 0x07;
+    d.channel = chIdx;
+
+    switch (env.portnum) {
+        case MESH_PORT_TEXT:
+            {
+                size_t n = env.payloadLen < sizeof(d.text.text) - 1 ? env.payloadLen : sizeof(d.text.text) - 1;
+                memcpy(d.text.text, env.payload, n);
+                d.text.text[n] = 0;
+            }
+            Serial.printf("[MESH] TEXT !%08lx: %s\n", (unsigned long)from2, d.text.text);
+            break;
+        case MESH_PORT_POSITION:
+            parsePosition(env.payload, env.payloadLen, d);
+            Serial.printf("[MESH] POS !%08lx: %.6f,%.6f alt%d\n",
+                          (unsigned long)from2, d.pos.latI / 1e7, d.pos.lonI / 1e7, d.pos.alt);
+            break;
+        case MESH_PORT_NODEINFO:
+            parseNodeInfo(env.payload, env.payloadLen, d);
+            Serial.printf("[MESH] NODE !%08lx: \"%s\" (%s) hw%u\n",
+                          (unsigned long)from2, d.nodeinfo.longName, d.nodeinfo.shortName, d.nodeinfo.hwModel);
+            break;
+        case MESH_PORT_TELEMETRY:
+            parseTelemetry(env.payload, env.payloadLen, d);
+            Serial.printf("[MESH] TELEM !%08lx: batt%.0f%% %.2fV ch%.1f%%\n",
+                          (unsigned long)from2, d.telemetry.battLevel, d.telemetry.voltage, d.telemetry.chUtil);
+            break;
+        default:
+            Serial.printf("[MESH] port %u from !%08lx (%u bytes)\n", env.portnum, (unsigned long)from2, (unsigned)env.payloadLen);
+            return;  // don't send unknown portnums
+    }
+
+    static uint16_t decSeq = 0;
+    d.seq = ++decSeq;
+    publishDecoded(d);
+}
+
 // ---------------- Radio modes ----------------
 
 static void enterMeshRx() {
@@ -198,13 +486,13 @@ static void handlePacket() {
     int8_t snr = (int8_t)radio.getSNR();
 
     if (st == RADIOLIB_ERR_NONE && len >= MESH_HDR_LEN) {
-        // Header is cleartext: to(0..3) from(4..7) id(8..11) flags channel next_hop relay
         uint32_t from = buf[4] | (buf[5] << 8) | (buf[6] << 16) | ((uint32_t)buf[7] << 24);
         if (from != 0) {
             noteNode(from, rssi, snr);
             if (s_meshPackets < 65535) s_meshPackets++;
             snprintf(s_lastHit, sizeof(s_lastHit), "MESH !%08lx %d", (unsigned long)from, rssi);
             Serial.printf("[MESH] from !%08lx len %u rssi %d snr %d\n", (unsigned long)from, (unsigned)len, rssi, snr);
+            tryDecode(buf, len, rssi, snr);
         }
     } else if (st == RADIOLIB_ERR_CRC_MISMATCH) {
         // Something LoRa-shaped on the mesh channel we couldn't decode
@@ -405,6 +693,7 @@ void setup() {
     memset(s_peak, -127, sizeof(s_peak));
     if (s_radioOk) enterMeshRx();
 
+    initMeshKey();
     startEspNow();
 }
 
