@@ -42,9 +42,19 @@ enum class Source : uint8_t {
     SYSTEM
 };
 
+enum class DeviceOS : uint8_t {
+    OS_UNKNOWN = 0,
+    OS_IOS,
+    OS_ANDROID,
+    OS_WINDOWS,
+    OS_SAMSUNG,
+    OS_LINUX
+};
+
 struct Detection {
     uint8_t  mac[6];
     int8_t   rssi;
+    int8_t   rssiSmooth;
     uint8_t  channel;
     Source   src;
     DetectionType type;
@@ -53,8 +63,10 @@ struct Detection {
     bool     following;
     bool     ignored;
     bool     used;
+    DeviceOS os;
     const char* vendor;
     char     name[33];
+    char     probeSSID[33];
     uint32_t firstSeen;
     uint32_t lastSeen;
     uint32_t trackStart;
@@ -71,6 +83,7 @@ const char* detectionTypeName(DetectionType t);
 const char* confidenceName(Confidence c);
 const char* sourceName(Source s);
 bool isTrackerType(DetectionType t);
+const char* deviceOSName(DeviceOS os);
 
 class DetectionEngine {
 public:
@@ -87,6 +100,17 @@ public:
 
     // Hold the sniffer on one channel (hunt mode); 0 resumes hopping
     void lockChannel(uint8_t ch);
+
+    // Hunt mode: track a target across MAC rotations
+    void startHunt(const uint8_t* mac, Source src);
+    void stopHunt();
+    bool huntActive() const { return _huntActive; }
+    uint32_t huntRotations() const { return _huntRotations; }
+    int  findHuntTarget();  // returns index, following MAC rotations
+
+    // Stealth mode: passive-only scanning, no TX
+    void setStealthMode(bool on);
+    bool stealthMode() const { return _stealthActive; }
 
     Detection* at(int i) { return &_det[i]; }
     int capacity() const { return MAX_DETECTIONS; }
@@ -109,10 +133,23 @@ public:
 private:
     Detection _det[MAX_DETECTIONS];
     bool _bleRunning = false;
+    bool _bleBoosted = false;
+    bool _wifiPausedForHunt = false;
+    bool _stealthActive = false;
+    bool _preStealthBle = false;
+    bool _preStealthWifi = false;
     bool _wifiRunning = false;
     bool _wifiInit = false;
     uint8_t _wifiChannel = 1;
     uint8_t _lockedChannel = 0;
+
+    // Hunt target state
+    bool _huntActive = false;
+    uint8_t _huntMac[6] = {};
+    Source  _huntSrc = Source::BLE;
+    DetectionType _huntType = DetectionType::UNKNOWN;
+    int8_t  _huntLastRssi = -127;
+    uint32_t _huntRotations = 0;
     uint32_t _lastHopMs = 0;
     uint32_t _lastSparkMs = 0;
     uint32_t _deauthWindowMs = 0;
@@ -133,6 +170,8 @@ private:
     void maybeAlert(int idx, bool force);
     void pushAlert(int idx);
     void hop();
+    void setBLEDuty(uint16_t interval, uint16_t window);
+    int  correlateRotation();
 };
 
 extern DetectionEngine detector;

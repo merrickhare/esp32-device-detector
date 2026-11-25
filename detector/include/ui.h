@@ -67,7 +67,9 @@ namespace Layout {
     static const Button SET_CAL    = {123, 136, 111, 38, "CALIBRATE", C_BTN};
     static const Button SET_UNIGN  = {6, 180, 111, 34, "UN-IGNORE", C_BTN};
     static const Button SET_CLEAR  = {123, 180, 111, 34, "CLEAR ALL", C_BTN};
-    static const Button SET_NET    = {6, 218, 228, 30, "WIFI SETUP (DESKTOP)", C_NAVY};
+    static const Button SET_STEALTH = {6, 218, 111, 30, nullptr, C_BTN};
+    static const Button SET_PCAP   = {123, 218, 111, 30, nullptr, C_BTN};
+    static const Button SET_NET    = {6, 252, 228, 24, "WIFI SETUP (DESKTOP)", C_NAVY};
     static const Button PORTAL_CANCEL = {0, 280, 240, 36, "CANCEL", C_BTN};
 
     static const Button LORA_BACK  = {0, 280, 240, 36, "< BACK", C_BTN};
@@ -140,10 +142,21 @@ private:
     Source _selSrc = Source::BLE;
     bool _selValid = false;
 
-    // Hunt history
+    // Hunt history + radar trail
     int8_t _hunt[55];
     uint8_t _huntHead = 0, _huntCount = 0;
     uint32_t _huntLastSeen = 0;
+    int8_t _radarTrail[RADAR_TRAIL_LEN];
+    uint8_t _radarHead = 0, _radarCount = 0;
+    float _sweepAngle = 0;
+    int8_t _peakRssi = -127;
+    int16_t _peakRadius = RADAR_R;
+
+    // Battery
+    uint32_t _battReadMs = 0;
+    uint16_t _battSamples[BATT_SAMPLES] = {};
+    uint8_t  _battIdx = 0, _battCount = 0;
+    int8_t   _battPercent = -1;  // -1 = no battery detected
 
     // Rate display
     uint32_t _rateMs = 0, _rateFrames = 0, _rateAdverts = 0;

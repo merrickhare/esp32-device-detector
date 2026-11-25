@@ -46,11 +46,54 @@
 #define FOLLOW_MS        600000   // tracker present 10 min => following
 #define FOLLOW_GAP_MS    300000   // gone 5 min => restart follow timer
 
+// --- Hunt mode ---
+#define HUNT_BLE_INTERVAL    100
+#define HUNT_BLE_WINDOW       90   // ~90% duty cycle during hunt
+#define NORMAL_BLE_INTERVAL  100
+#define NORMAL_BLE_WINDOW     50   // ~50% duty cycle normally
+#define HUNT_STALE_MS       4000   // target silent this long → look for rotated MAC
+#define HUNT_RSSI_TOLERANCE   15   // dB window for MAC rotation match
+#define RSSI_EMA_ALPHA        0.3f // smoothing factor (0–1, lower = smoother)
+#define HUNT_PAUSE_WIFI     true  // pause WiFi sniffer during hunt for 100% BLE antenna
+
+// --- Radar display ---
+#define RADAR_CX            120
+#define RADAR_CY            146
+#define RADAR_R              88
+#define RADAR_RINGS            5
+#define RADAR_TRAIL_LEN       36   // samples in sweep trail
+#define RADAR_RSSI_MIN     -100   // outer edge
+#define RADAR_RSSI_MAX      -35   // center
+#define RADAR_SWEEP_DEG       10   // degrees per sample
+
+// --- False positive filter ---
+#define AIRTAG_RATE_MIN     0.15f  // min hits/sec for real AirTag
+#define AIRTAG_RATE_MAX     1.5f   // max hits/sec (above = phone/AirPods)
+#define AIRTAG_RATE_SAMPLES   10   // need this many hits before filtering
+
+// --- Battery monitoring ---
+#ifndef PIN_BATTERY
+#define PIN_BATTERY          35   // ADC1 input-only pin (override in local_config.h)
+#endif
+#define BATT_DIVIDER       2.0f   // Vbat / Vadc ratio (100k/100k = 2.0)
+#define BATT_FULL_MV       4200
+#define BATT_EMPTY_MV      3000
+#define BATT_READ_MS      10000   // read interval
+#define BATT_SAMPLES          8   // rolling average window
+#define BATT_MIN_VALID_MV  2500   // below this = no battery circuit
+
+// --- Stealth mode ---
+#define STEALTH_BRIGHTNESS    5
+
+// --- PCAP capture ---
+#define PCAP_SNAPLEN        128   // max bytes per packet saved
+#define PCAP_DLT_80211      105   // IEEE 802.11
+
 // --- UI ---
 #define POPUP_MS           4000
 #define HOME_REFRESH_MS    1000
 #define LIST_REFRESH_MS    2000
-#define HUNT_REFRESH_MS     400
+#define HUNT_REFRESH_MS     200   // faster for radar display
 
 // --- Backlight ---
 #define BACKLIGHT_CHANNEL  0

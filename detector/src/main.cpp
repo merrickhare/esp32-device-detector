@@ -5,6 +5,7 @@
 #include "ui.h"
 #include "touch.h"
 #include "sdlog.h"
+#include "pcap.h"
 #include "loralink.h"
 #include "netsync.h"
 
@@ -305,6 +306,23 @@ static void touchSettings(int16_t x, int16_t y) {
         ui.showMessage("DONE", "All devices un-ignored", C_OK);
         delay(700);
         ui.redraw();
+    } else if (Display::hit(SET_STEALTH, x, y)) {
+        bool on = !detector.stealthMode();
+        detector.setStealthMode(on);
+        if (on) {
+            ui.setBrightness(STEALTH_BRIGHTNESS);
+        } else {
+            ui.setBrightness(prefs.getUChar("bright", BACKLIGHT_DEFAULT));
+        }
+        ui.redraw();
+    } else if (Display::hit(SET_PCAP, x, y)) {
+        if (pcapLog.running()) {
+            pcapLog.stop();
+        } else {
+            if (!pcapLog.begin())
+                ui.showMessage("PCAP", "SD card not ready", C_DANGER);
+        }
+        ui.redraw();
     } else if (Display::hit(SET_NET, x, y)) {
         runPortal();
     } else if (Display::hit(SET_BACK, x, y)) {
@@ -332,6 +350,8 @@ void setup() {
 
     bool sdOk = sdLog.init();
     Serial.printf("[+] SD Card: %s\n", sdOk ? "OK" : "Not found");
+
+    analogSetPinAttenuation(PIN_BATTERY, ADC_11db);
 
     detector.init();
     detector.startBLE();
@@ -461,5 +481,6 @@ void loop() {
     }
 
     sdLog.flush();
+    pcapLog.flush();
     delay(10);
 }

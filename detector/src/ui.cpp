@@ -1,10 +1,28 @@
 #include "ui.h"
 #include "sdlog.h"
+#include "pcap.h"
 #include "loralink.h"
 
 Display ui;
 
 static const uint16_t C_COLD = 0x041F;
+
+// LiPo discharge curve (mV → %)
+static uint8_t voltToPercent(uint16_t mv) {
+    if (mv >= 4200) return 100;
+    if (mv >= 4060) return 90;
+    if (mv >= 3980) return 80;
+    if (mv >= 3920) return 70;
+    if (mv >= 3870) return 60;
+    if (mv >= 3820) return 50;
+    if (mv >= 3790) return 40;
+    if (mv >= 3770) return 30;
+    if (mv >= 3740) return 20;
+    if (mv >= 3680) return 10;
+    if (mv >= 3500) return 5;
+    if (mv >= 3000) return 1;
+    return 0;
+}
 
 void fmtMac(const uint8_t* m, char* out) {
     sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
@@ -44,7 +62,7 @@ static const char* proximityLabel(int8_t rssi) {
 
 void Display::init() {
     _tft.init();
-    _tft.setRotation(0);
+    _tft.setRotation(2);
     _tft.fillScreen(C_BG);
     _tft.setTextDatum(TL_DATUM);
 
@@ -96,7 +114,10 @@ int Display::selected() const {
 }
 
 void Display::go(Screen s) {
-    if (_screen == Screen::HUNT && s != Screen::HUNT) detector.lockChannel(0);
+    if (_screen == Screen::HUNT && s != Screen::HUNT) {
+        detector.lockChannel(0);
+        detector.stopHunt();
+    }
     if (_screen == Screen::DESKTOP && s != Screen::DESKTOP) freeDesktop();
     _screen = s;
 
@@ -109,6 +130,7 @@ void Display::go(Screen s) {
         if (idx >= 0) {
             Detection* d = detector.at(idx);
             if (d->src == Source::AP && d->channel) detector.lockChannel(d->channel);
+            detector.startHunt(d->mac, d->src);
         }
     }
     redraw();
@@ -168,16 +190,55 @@ void Display::drawStatusBar() {
     _tft.setTextColor(jam ? C_DANGER : loraLink.online() ? C_OK : C_DIM, C_PANEL);
     _tft.drawString("LR", 106, 5, 1);
 
-    int threats = detector.countAlerts();
-    if (threats > 0) snprintf(buf, sizeof(buf), "!%-3d", threats);
-    else strcpy(buf, "    ");
-    _tft.setTextColor(C_DANGER, C_PANEL);
-    _tft.drawString(buf, 126, 5, 1);
+    if (detector.stealthMode()) {
+        _tft.setTextColor(C_ZGOLD, C_PANEL);
+        _tft.drawString("STL", 124, 5, 1);
+    } else {
+        int threats = detector.countAlerts();
+        if (threats > 0) snprintf(buf, sizeof(buf), "!%-3d", threats);
+        else strcpy(buf, "    ");
+        _tft.setTextColor(C_DANGER, C_PANEL);
+        _tft.drawString(buf, 124, 5, 1);
+    }
 
-    fmtUptime(buf, sizeof(buf));
+    if (pcapLog.running()) {
+        _tft.setTextColor(C_ZRED, C_PANEL);
+        _tft.drawString("REC", 150, 5, 1);
+    }
+
+    // Battery gauge (read periodically)
+    uint32_t now = millis();
+    if (now - _battReadMs > BATT_READ_MS) {
+        _battReadMs = now;
+        uint16_t raw = analogReadMilliVolts(PIN_BATTERY);
+        uint16_t mv = (uint16_t)(raw * BATT_DIVIDER);
+        if (mv >= BATT_MIN_VALID_MV && mv <= 4400) {
+            _battSamples[_battIdx] = mv;
+            _battIdx = (_battIdx + 1) % BATT_SAMPLES;
+            if (_battCount < BATT_SAMPLES) _battCount++;
+            uint32_t sum = 0;
+            for (int i = 0; i < _battCount; i++) sum += _battSamples[i];
+            _battPercent = voltToPercent(sum / _battCount);
+        } else {
+            _battPercent = -1;
+        }
+    }
+
     _tft.setTextDatum(TR_DATUM);
-    _tft.setTextColor(C_MUTED, C_PANEL);
-    _tft.drawString(buf, SCREEN_W - 4, 5, 1);
+    if (_battPercent >= 0) {
+        // Draw battery icon: outline + fill level
+        int bx = SCREEN_W - 26, by = 4, bw = 20, bh = 10;
+        _tft.drawRect(bx, by, bw, bh, C_MUTED);
+        _tft.fillRect(bx + bw, by + 3, 2, 4, C_MUTED);  // nub
+        int fill = (_battPercent * (bw - 2)) / 100;
+        uint16_t fc = _battPercent > 20 ? C_OK : _battPercent > 10 ? C_LOW : C_DANGER;
+        if (fill > 0) _tft.fillRect(bx + 1, by + 1, fill, bh - 2, fc);
+        if (fill < bw - 2) _tft.fillRect(bx + 1 + fill, by + 1, bw - 2 - fill, bh - 2, C_PANEL);
+    } else {
+        _tft.setTextColor(C_MUTED, C_PANEL);
+        fmtUptime(buf, sizeof(buf));
+        _tft.drawString(buf, SCREEN_W - 4, 5, 1);
+    }
     _tft.setTextDatum(TL_DATUM);
 }
 
@@ -551,15 +612,18 @@ void Display::drawList(bool full) {
 
         char mac[18];
         fmtMac(d.mac, mac);
+        const char* osTag = deviceOSName(d.os);
         if (d.following) {
             snprintf(buf, sizeof(buf), "FOLLOWING  %s", d.vendor ? d.vendor : mac);
         } else if (typed) {
             snprintf(buf, sizeof(buf), "%s%s%s", d.vendor ? d.vendor : mac,
-                     d.ignored ? " (ignored)" : "", "");
+                     d.ignored ? " (ignored)" : "", osTag ? (String(" [") + osTag + "]").c_str() : "");
         } else if (d.src == Source::AP) {
             snprintf(buf, sizeof(buf), "%s ch%u %s", mac, d.channel, d.encrypted ? "WPA" : "OPEN");
         } else {
-            snprintf(buf, sizeof(buf), "%s %s", mac, d.vendor ? d.vendor : "");
+            snprintf(buf, sizeof(buf), "%s %s%s%s", mac, d.vendor ? d.vendor : "",
+                     osTag ? " [" : "", osTag ? osTag : "");
+            if (osTag) strlcat(buf, "]", sizeof(buf));
         }
         buf[32] = 0;
         _tft.setTextColor(d.following ? C_DANGER : C_MUTED, bg);
@@ -640,7 +704,18 @@ void Display::drawDetail(bool full) {
         uint16_t vc = C_FG;
         switch (i) {
             case 0: strlcpy(val, d.name[0] ? d.name : "-", sizeof(val)); break;
-            case 1: strlcpy(val, d.vendor ? d.vendor : "-", sizeof(val)); break;
+            case 1: {
+                const char* osn = deviceOSName(d.os);
+                if (d.vendor && osn)
+                    snprintf(val, sizeof(val), "%s [%s]", d.vendor, osn);
+                else if (d.vendor)
+                    strlcpy(val, d.vendor, sizeof(val));
+                else if (osn)
+                    snprintf(val, sizeof(val), "[%s]", osn);
+                else
+                    strcpy(val, "-");
+                break;
+            }
             case 2:
                 snprintf(val, sizeof(val), "%s%s", mac,
                          (d.src != Source::SYSTEM && (d.mac[0] & 0x02)) ? " rnd" : "");
@@ -648,9 +723,12 @@ void Display::drawDetail(bool full) {
             case 3:
                 if (d.src == Source::AP)
                     snprintf(val, sizeof(val), "WiFi AP  ch%u  %s", d.channel, d.encrypted ? "WPA" : "OPEN");
-                else if (d.src == Source::CLIENT)
-                    snprintf(val, sizeof(val), "WiFi client  ch%u", d.channel);
-                else
+                else if (d.src == Source::CLIENT) {
+                    if (d.probeSSID[0])
+                        snprintf(val, sizeof(val), "WiFi ch%u  probe: %s", d.channel, d.probeSSID);
+                    else
+                        snprintf(val, sizeof(val), "WiFi client  ch%u", d.channel);
+                } else
                     strlcpy(val, sourceName(d.src), sizeof(val));
                 break;
             case 4:
@@ -697,9 +775,19 @@ void Display::drawDetail(bool full) {
     }
 }
 
+static int16_t rssiToRadius(int8_t rssi) {
+    int clamped = constrain(rssi, RADAR_RSSI_MIN, RADAR_RSSI_MAX);
+    return RADAR_R - (int16_t)((clamped - RADAR_RSSI_MIN) * (long)RADAR_R /
+                               (RADAR_RSSI_MAX - RADAR_RSSI_MIN));
+}
+
 void Display::drawHunt(bool full) {
     uint32_t now = millis();
-    int idx = selected();
+    int idx = detector.huntActive() ? detector.findHuntTarget() : selected();
+    if (detector.huntActive() && idx >= 0) {
+        Detection* d = detector.at(idx);
+        if (memcmp(d->mac, _selMac, 6) != 0) select(idx);
+    }
     if (full) {
         _tft.fillScreen(C_BG);
         drawButton(Layout::HUNT_BACK);
@@ -714,113 +802,182 @@ void Display::drawHunt(bool full) {
     }
     const Detection& d = *detector.at(idx);
     char buf[48];
+    int8_t rssi = d.rssiSmooth != -127 ? d.rssiSmooth : d.rssi;
+    uint32_t age = now - d.lastSeen;
+    bool lost = age > 5000;
+    uint16_t col = lost ? C_DIM : proximityColor(rssi);
 
+    // --- Header: name + live RSSI ---
     if (full) {
         _huntRssiShown = 999;
         _huntTrendShown = -2;
-        labelFor(d, buf, sizeof(buf));
-        fitText(_tft, buf, 220, 2);
-        _tft.setTextDatum(MC_DATUM);
-        _tft.setTextColor(d.type != DetectionType::UNKNOWN ? colorFor(d) : C_ACCENT, C_BG);
-        _tft.drawString(buf, 120, 28, 2);
-        fmtMac(d.mac, buf);
-        _tft.setTextColor(C_MUTED, C_BG);
-        _tft.drawString(buf, 120, 45, 1);
-        _tft.setTextDatum(TL_DATUM);
+        _radarHead = _radarCount = 0;
+        _sweepAngle = 0;
+        _peakRssi = -127;
+        _peakRadius = RADAR_R;
+        memset(_radarTrail, -127, sizeof(_radarTrail));
     }
 
-    // Record a sample per refresh; -127 marks "not heard this tick"
-    _hunt[_huntHead] = d.lastSeen != _huntLastSeen ? d.rssi : -127;
+    labelFor(d, buf, sizeof(buf));
+    fitText(_tft, buf, 160, 2);
+    _tft.fillRect(0, 20, SCREEN_W, 14, C_BG);
+    _tft.setTextDatum(TL_DATUM);
+    _tft.setTextColor(d.type != DetectionType::UNKNOWN ? colorFor(d) : C_ACCENT, C_BG);
+    _tft.drawString(buf, 6, 22, 2);
+
+    snprintf(buf, sizeof(buf), "%d dBm", rssi);
+    _tft.setTextDatum(TR_DATUM);
+    _tft.setTextColor(col, C_BG);
+    _tft.drawString(buf, SCREEN_W - 6, 22, 2);
+    _tft.setTextDatum(TL_DATUM);
+
+    // MAC line
+    fmtMac(d.mac, buf);
+    _tft.fillRect(0, 36, SCREEN_W, 10, C_BG);
+    _tft.setTextDatum(MC_DATUM);
+    _tft.setTextColor(C_MUTED, C_BG);
+    _tft.drawString(buf, 120, 40, 1);
+    _tft.setTextDatum(TL_DATUM);
+
+    // --- Record sample ---
+    int8_t sample = (d.lastSeen != _huntLastSeen) ? rssi : -127;
     _huntLastSeen = d.lastSeen;
-    _huntHead = (_huntHead + 1) % sizeof(_hunt);
-    if (_huntCount < sizeof(_hunt)) _huntCount++;
 
-    uint32_t age = now - d.lastSeen;
-    bool lost = age > 5000;
-    int8_t rssi = d.rssi;
-    uint16_t col = lost ? C_DIM : proximityColor(rssi);
-
-    // Big RSSI readout (font 7 is digits only, so draw the minus sign by hand)
-    int16_t shownKey = lost ? 1000 : rssi;
-    if (shownKey != _huntRssiShown) {
-        _huntRssiShown = shownKey;
-        _tft.fillRect(0, 54, SCREEN_W, 54, C_BG);
-        snprintf(buf, sizeof(buf), "%d", rssi < 0 ? -rssi : rssi);
-        int w = _tft.textWidth(buf, 7);
-        int x = (SCREEN_W - w - 16 - 30) / 2 + 16;
-        _tft.setTextColor(col, C_BG);
-        if (rssi < 0) _tft.fillRect(x - 16, 79, 11, 5, col);
-        _tft.drawString(buf, x, 56, 7);
-        _tft.drawString("dBm", x + w + 4, 88, 2);
-
-        _tft.fillRect(0, 108, SCREEN_W, 30, C_BG);
-        _tft.setTextDatum(MC_DATUM);
-        _tft.setTextColor(col, C_BG);
-        _tft.drawString(lost ? "SIGNAL LOST" : proximityLabel(rssi), 120, 123, 4);
-        _tft.setTextDatum(TL_DATUM);
+    if (sample != -127) {
+        _radarTrail[_radarHead] = sample;
+        _radarHead = (_radarHead + 1) % RADAR_TRAIL_LEN;
+        if (_radarCount < RADAR_TRAIL_LEN) _radarCount++;
+        if (sample > _peakRssi) {
+            _peakRssi = sample;
+            _peakRadius = rssiToRadius(sample);
+        }
+        _sweepAngle += RADAR_SWEEP_DEG;
+        if (_sweepAngle >= 360.0f) _sweepAngle -= 360.0f;
     }
 
-    // Hot/cold meter
-    int lit = lost ? 0 : constrain(map(rssi, -100, -35, 0, 22), 0, 22);
-    for (int i = 0; i < 22; i++) {
-        uint16_t c = i < 7 ? C_COLD : i < 12 ? C_OK : i < 17 ? C_LOW : i < 20 ? C_MED : C_HIGH;
-        _tft.fillRect(10 + i * 10, 142, 8, 18, i < lit ? c : C_DIM);
+    // Also feed the old trend buffer
+    _hunt[_huntHead] = sample;
+    _huntHead = (_huntHead + 1) % (uint8_t)sizeof(_hunt);
+    if (_huntCount < (uint8_t)sizeof(_hunt)) _huntCount++;
+
+    // --- Radar display ---
+    // Clear radar area
+    _tft.fillCircle(RADAR_CX, RADAR_CY, RADAR_R + 1, C_BG);
+
+    // Concentric rings
+    for (int i = 1; i <= RADAR_RINGS; i++) {
+        int r = i * RADAR_R / RADAR_RINGS;
+        _tft.drawCircle(RADAR_CX, RADAR_CY, r, C_DIM);
+    }
+    // Crosshairs
+    _tft.drawFastHLine(RADAR_CX - RADAR_R, RADAR_CY, RADAR_R * 2, C_DIM);
+    _tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_R, RADAR_R * 2, C_DIM);
+
+    // Ring labels
+    _tft.setTextDatum(TL_DATUM);
+    _tft.setTextColor(C_MUTED, C_BG);
+    _tft.drawString("FAR", RADAR_CX + 2, RADAR_CY - RADAR_R + 2, 1);
+    _tft.drawString("CLOSE", RADAR_CX + 2, RADAR_CY - RADAR_R * 3 / 5 + 2, 1);
+
+    // Peak ring (dashed effect via dots)
+    if (_peakRssi > -127) {
+        for (int a = 0; a < 360; a += 8) {
+            float rad = a * 3.14159f / 180.0f;
+            int px = RADAR_CX + (int)(_peakRadius * cosf(rad));
+            int py = RADAR_CY + (int)(_peakRadius * sinf(rad));
+            _tft.drawPixel(px, py, C_OK);
+        }
     }
 
-    // Trend: last 4 heard samples vs the 4 before
-    int recent = 0, older = 0, nr = 0, no = 0;
-    for (int i = 0; i < _huntCount && (nr < 4 || no < 4); i++) {
+    // Trail dots: older = dimmer, newer = brighter
+    float angle = _sweepAngle;
+    for (int i = _radarCount - 1; i >= 0; i--) {
+        int idx2 = (_radarHead + RADAR_TRAIL_LEN - 1 - i) % RADAR_TRAIL_LEN;
+        int8_t s = _radarTrail[idx2];
+        if (s == -127) { angle -= RADAR_SWEEP_DEG; continue; }
+
+        int16_t r = rssiToRadius(s);
+        float rad = angle * 3.14159f / 180.0f;
+        int dx = RADAR_CX + (int)(r * cosf(rad));
+        int dy = RADAR_CY + (int)(r * sinf(rad));
+
+        float fade = (float)(_radarCount - 1 - i) / (float)_radarCount;
+        uint16_t dotCol;
+        if (fade > 0.7f)      dotCol = C_DIM;
+        else if (fade > 0.4f) dotCol = proximityColor(s) & 0x7BEF; // half brightness
+        else                  dotCol = proximityColor(s);
+
+        int dotR = (i < 3) ? 3 : 2;
+        _tft.fillCircle(dx, dy, dotR, dotCol);
+        angle -= RADAR_SWEEP_DEG;
+    }
+
+    // Current position: big bright dot
+    if (!lost && _radarCount > 0) {
+        int16_t r = rssiToRadius(rssi);
+        float rad = _sweepAngle * 3.14159f / 180.0f;
+        int cx = RADAR_CX + (int)(r * cosf(rad));
+        int cy = RADAR_CY + (int)(r * sinf(rad));
+        _tft.fillCircle(cx, cy, 5, col);
+        _tft.drawCircle(cx, cy, 6, C_FG);
+    }
+
+    // Sweep line (faint, from center to current dot position)
+    if (!lost) {
+        float rad = _sweepAngle * 3.14159f / 180.0f;
+        int ex = RADAR_CX + (int)(RADAR_R * cosf(rad));
+        int ey = RADAR_CY + (int)(RADAR_R * sinf(rad));
+        _tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, C_DIM);
+    }
+
+    // --- Proximity label + trend below radar ---
+    _tft.fillRect(0, RADAR_CY + RADAR_R + 4, SCREEN_W, 16, C_BG);
+    _tft.setTextDatum(MC_DATUM);
+    _tft.setTextColor(col, C_BG);
+    _tft.drawString(lost ? "SIGNAL LOST" : proximityLabel(rssi),
+                    120, RADAR_CY + RADAR_R + 12, 2);
+
+    // Trend: last 6 heard samples vs the 6 before (more samples = smoother)
+    int recent = 0, older = 0, nr = 0, no2 = 0;
+    for (int i = 0; i < _huntCount && (nr < 6 || no2 < 6); i++) {
         int8_t s = _hunt[(_huntHead + sizeof(_hunt) - 1 - i) % sizeof(_hunt)];
         if (s == -127) continue;
-        if (nr < 4) { recent += s; nr++; }
-        else        { older += s; no++; }
+        if (nr < 6) { recent += s; nr++; }
+        else         { older += s; no2++; }
     }
-    int8_t trend = -1;
-    if (nr == 4 && no == 4) {
-        int diff = (recent - older) / 4;
-        trend = diff >= 3 ? 1 : diff <= -3 ? 2 : 0;
+    _tft.fillRect(0, RADAR_CY + RADAR_R + 20, SCREEN_W, 14, C_BG);
+    if (nr == 6 && no2 == 6) {
+        int diff = (recent - older) / 6;
+        const char* trendStr = diff >= 3 ? "GETTING CLOSER" : diff <= -3 ? "MOVING AWAY" : "STEADY";
+        uint16_t tc = diff >= 3 ? C_OK : diff <= -3 ? C_MED : C_MUTED;
+        _tft.setTextColor(tc, C_BG);
+        _tft.drawString(trendStr, 120, RADAR_CY + RADAR_R + 27, 2);
+    } else {
+        _tft.setTextColor(C_MUTED, C_BG);
+        _tft.drawString("walk around slowly...", 120, RADAR_CY + RADAR_R + 27, 2);
     }
-    if (trend != _huntTrendShown) {
-        _huntTrendShown = trend;
-        _tft.fillRect(0, 163, SCREEN_W, 20, C_BG);
-        _tft.setTextDatum(MC_DATUM);
-        switch (trend) {
-            case 1:  _tft.setTextColor(C_OK, C_BG);    _tft.drawString("GETTING CLOSER", 120, 173, 2); break;
-            case 2:  _tft.setTextColor(C_MED, C_BG);   _tft.drawString("MOVING AWAY", 120, 173, 2); break;
-            case 0:  _tft.setTextColor(C_MUTED, C_BG); _tft.drawString("STEADY", 120, 173, 2); break;
-            default: _tft.setTextColor(C_MUTED, C_BG); _tft.drawString("walk around slowly...", 120, 173, 2);
-        }
-        _tft.setTextDatum(TL_DATUM);
-    }
+    _tft.setTextDatum(TL_DATUM);
 
-    // Rolling history, painted column by column so nothing is blanked first
-    const int gx = 10, gy = 188, gh = 72;
-    const int cols = sizeof(_hunt);
-    for (int j = 0; j < cols; j++) {
-        int8_t s = -127;
-        int age = cols - 1 - j;
-        if (age < _huntCount) s = _hunt[(_huntHead + cols - 1 - age) % cols];
-        int bh = s == -127 ? 0 : 2 + (constrain(s, -100, -30) + 100) * (gh - 2) / 70;
-        int cx = gx + j * 4;
-        if (bh < gh) _tft.fillRect(cx, gy, 3, gh - bh, C_BG);
-        if (bh > 0)  _tft.fillRect(cx, gy + gh - bh, 3, bh, proximityColor(s));
-    }
-    if (full) _tft.drawFastHLine(gx, gy + gh, 220, C_DIM);
-
-    char ago[12];
-    fmtAgo(age, ago, sizeof(ago));
-    if (d.src == Source::AP)
-        snprintf(buf, sizeof(buf), "locked ch%u   heard %s ago   x%u", d.channel, ago, d.hits);
+    // --- Status line ---
+    char ago2[12];
+    fmtAgo(age, ago2, sizeof(ago2));
+    if (_peakRssi > -127)
+        snprintf(buf, sizeof(buf), "peak %ddBm  %s  %s ago  x%u",
+                 _peakRssi, sourceName(d.src), ago2, d.hits);
     else
-        snprintf(buf, sizeof(buf), "%s   heard %s ago   x%u", sourceName(d.src), ago, d.hits);
-    // Centre inside a fixed 38-char field so the old text is overwritten, not blanked
+        snprintf(buf, sizeof(buf), "%s  %s ago  x%u", sourceName(d.src), ago2, d.hits);
+    if (detector.huntActive() && detector.huntRotations() > 0) {
+        char rot[16];
+        snprintf(rot, sizeof(rot), "  rot:%lu", (unsigned long)detector.huntRotations());
+        strlcat(buf, rot, sizeof(buf));
+    }
     char line[40];
     int len = strlen(buf);
     if (len > 38) len = 38;
     int pad = (38 - len) / 2;
     snprintf(line, sizeof(line), "%*s%.*s%*s", pad, "", len, buf, 38 - len - pad, "");
     _tft.setTextColor(C_MUTED, C_BG);
-    _tft.drawString(line, 6, 265, 1);
+    _tft.drawString(line, 6, 268, 1);
 }
 
 void Display::drawSettings(bool full) {
@@ -838,22 +995,35 @@ void Display::drawSettings(bool full) {
         drawButton(Layout::SET_CAL);
         drawButton(Layout::SET_UNIGN);
         drawButton(Layout::SET_CLEAR);
+        bool stl = detector.stealthMode();
+        drawButton(Layout::SET_STEALTH, stl ? "STEALTH: ON" : "STEALTH", stl ? C_ZGOLD : C_BTN);
+        drawButton(Layout::SET_PCAP, pcapLog.running() ? "PCAP: ON" : "PCAP: OFF",
+                   pcapLog.running() ? C_ZRED : C_BTN);
         drawButton(Layout::SET_NET);
         drawButton(Layout::SET_BACK);
     }
     drawStatusBar();
 
     char buf[48];
-    char lines[3][48];
-    if (sdLog.isReady()) snprintf(lines[0], 48, "SD: %s  (%lu alerts)", sdLog.fileName(), (unsigned long)sdLog.lines());
-    else strcpy(lines[0], "SD: not found");
-    snprintf(lines[1], 48, "Heap %uKB (min %uKB)  Bright %d%%", ESP.getFreeHeap() / 1024,
-             ESP.getMinFreeHeap() / 1024, _brightness * 100 / 255);
-    strlcpy(lines[2], resetInfo, 48);
-    for (int i = 0; i < 3; i++) {
+    char lines[2][48];
+    if (sdLog.isReady()) {
+        if (pcapLog.running())
+            snprintf(lines[0], 48, "SD: %s  PCAP:%lu", sdLog.fileName(), (unsigned long)pcapLog.packets());
+        else
+            snprintf(lines[0], 48, "SD: %s  (%lu alerts)", sdLog.fileName(), (unsigned long)sdLog.lines());
+    } else {
+        strcpy(lines[0], "SD: not found");
+    }
+    if (_battPercent >= 0)
+        snprintf(lines[1], 48, "Heap %uKB  Batt %d%%  Bright %d%%",
+                 ESP.getFreeHeap() / 1024, _battPercent, _brightness * 100 / 255);
+    else
+        snprintf(lines[1], 48, "Heap %uKB (min %uKB)  Bright %d%%",
+                 ESP.getFreeHeap() / 1024, ESP.getMinFreeHeap() / 1024, _brightness * 100 / 255);
+    for (int i = 0; i < 2; i++) {
         snprintf(buf, sizeof(buf), "%-38.38s", lines[i]);
-        _tft.setTextColor(i == 2 && strstr(resetInfo, "CRASH") ? C_DANGER : C_MUTED, C_BG);
-        _tft.drawString(buf, 6, 252 + i * 9, 1);
+        _tft.setTextColor(C_MUTED, C_BG);
+        _tft.drawString(buf, 6, 278 + i * 9, 1);
     }
 }
 

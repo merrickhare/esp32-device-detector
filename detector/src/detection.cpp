@@ -1,5 +1,6 @@
 #include "detection.h"
 #include "signatures.h"
+#include "pcap.h"
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -49,6 +50,17 @@ bool isTrackerType(DetectionType t) {
     return t == DT::AIRTAG || t == DT::SAMSUNG_TAG || t == DT::TILE_TRACKER || t == DT::GOOGLE_TAG;
 }
 
+const char* deviceOSName(DeviceOS os) {
+    switch (os) {
+        case DeviceOS::OS_IOS:     return "iOS";
+        case DeviceOS::OS_ANDROID: return "Android";
+        case DeviceOS::OS_WINDOWS: return "Windows";
+        case DeviceOS::OS_SAMSUNG: return "Samsung";
+        case DeviceOS::OS_LINUX:   return "Linux";
+        default:                   return nullptr;
+    }
+}
+
 // --- Radio → main loop mailbox ---
 // Radio callbacks run in the NimBLE / WiFi tasks; they classify and post here,
 // and only loop() touches the detection table.
@@ -64,6 +76,7 @@ struct RadioEvent {
     uint8_t channel;
     DT      type;
     CF      conf;
+    DeviceOS os;
     const char* vendor;
     char    name[33];
 };
@@ -111,6 +124,8 @@ static void wifiCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     const uint8_t* f = pkt->payload;
     int len = (int)pkt->rx_ctrl.sig_len - 4;  // strip FCS
     if (len < 24) return;
+
+    if (pcapLog.running()) pcapLog.writePacket(f, len);
 
     uint8_t sub = (f[0] >> 4) & 0x0F;
     const uint8_t* addr2 = f + 10;
@@ -261,8 +276,14 @@ class BleCallbacks : public NimBLEScanCallbacks {
                     } else if ((at == 0x07 || at == 0x0F) && !isPublic) {
                         ev.flags |= F_SPAM;
                     }
-                } else if (cid == 0x0006 && ml >= 1 && m[0] == 0x03 && !isPublic) {
-                    ev.flags |= F_SPAM;  // Microsoft Swift Pair
+                    if (ev.os == DeviceOS::OS_UNKNOWN) ev.os = DeviceOS::OS_IOS;
+                } else if (cid == 0x0006) {
+                    if (ml >= 1 && m[0] == 0x03 && !isPublic) ev.flags |= F_SPAM;
+                    if (ev.os == DeviceOS::OS_UNKNOWN) ev.os = DeviceOS::OS_WINDOWS;
+                } else if (cid == 0x0075) {
+                    if (ev.os == DeviceOS::OS_UNKNOWN) ev.os = DeviceOS::OS_SAMSUNG;
+                } else if (cid == 0x00E0) {
+                    if (ev.os == DeviceOS::OS_UNKNOWN) ev.os = DeviceOS::OS_ANDROID;
                 }
                 const char* vv = nullptr; CF cc = CF::CONF_LOW;
                 DT tt = Signatures::lookupMfgId(cid, &vv, &cc);
@@ -396,6 +417,7 @@ int DetectionEngine::allocate(const uint8_t* mac, Source src) {
     d.firstSeen = millis();
     d.trackStart = d.firstSeen;
     d.quietBar = -127;
+    d.rssiSmooth = -127;
     return slot;
 }
 
@@ -510,16 +532,25 @@ void DetectionEngine::drainEvents() {
             d.following = false;
         }
         d.rssi = ev.rssi;
+        if (d.rssiSmooth == -127)
+            d.rssiSmooth = ev.rssi;
+        else
+            d.rssiSmooth = (int8_t)(RSSI_EMA_ALPHA * ev.rssi +
+                                     (1.0f - RSSI_EMA_ALPHA) * d.rssiSmooth);
         d.lastSeen = now;
         if (d.hits < 65535) d.hits++;
         if (ev.channel) d.channel = ev.channel;
 
         if (ev.name[0]) {
-            strlcpy(d.name, ev.name, sizeof(d.name));
+            if (src == Source::CLIENT)
+                strlcpy(d.probeSSID, ev.name, sizeof(d.probeSSID));
+            else
+                strlcpy(d.name, ev.name, sizeof(d.name));
         } else if ((ev.flags & F_HIDDEN) && !d.name[0]) {
             strcpy(d.name, "<hidden>");
         }
         if (src == Source::AP) d.encrypted = ev.flags & F_ENC;
+        if (ev.os != DeviceOS::OS_UNKNOWN) d.os = ev.os;
 
         if (ev.type != DT::UNKNOWN &&
             d.type != DT::EVIL_TWIN &&
@@ -576,6 +607,20 @@ void DetectionEngine::loop() {
             if (d.sparkCount < SIGNAL_TRAIL_LEN) d.sparkCount++;
         }
 
+        // Rate-based false positive filter for AirTag-like detections:
+        // real AirTags advertise at ~0.5 Hz; phones/AirPods are much faster
+        if (d.type == DT::AIRTAG && d.hits >= AIRTAG_RATE_SAMPLES && active) {
+            uint32_t elapsed = now - d.firstSeen;
+            if (elapsed > 2000) {
+                float rate = d.hits * 1000.0f / elapsed;
+                if (rate > AIRTAG_RATE_MAX) {
+                    d.type = DT::FINDMY;
+                    d.conf = CF::CONF_LOW;
+                    d.vendor = "Find My (likely phone)";
+                }
+            }
+        }
+
         // A tracker that has stayed with you for FOLLOW_MS is following you
         if (isTrackerType(d.type) && !d.following && active &&
             now - d.trackStart > FOLLOW_MS) {
@@ -628,4 +673,148 @@ void DetectionEngine::clearAll() {
     memset(_det, 0, sizeof(_det));
     _alertHead = _alertTail = 0;
     if (s_queue) xQueueReset(s_queue);
+}
+
+// --- Hunt mode with MAC rotation tracking ---
+
+void DetectionEngine::setBLEDuty(uint16_t interval, uint16_t window) {
+    if (!_bleRunning) return;
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    scan->stop();
+    scan->setInterval(interval);
+    scan->setWindow(window);
+    _bleRunning = scan->start(0, false, true);
+}
+
+void DetectionEngine::startHunt(const uint8_t* mac, Source src) {
+    memcpy(_huntMac, mac, 6);
+    _huntSrc = src;
+    _huntActive = true;
+    _huntRotations = 0;
+
+    int idx = find(mac, src);
+    if (idx >= 0) {
+        _huntType = _det[idx].type;
+        _huntLastRssi = _det[idx].rssiSmooth != -127 ? _det[idx].rssiSmooth : _det[idx].rssi;
+    } else {
+        _huntType = DT::UNKNOWN;
+        _huntLastRssi = -127;
+    }
+
+    if (!_bleBoosted) {
+        setBLEDuty(HUNT_BLE_INTERVAL, HUNT_BLE_WINDOW);
+        _bleBoosted = true;
+        Serial.println("[DET] BLE boosted for hunt");
+    }
+
+    if (HUNT_PAUSE_WIFI && _wifiRunning) {
+        stopWiFi();
+        _wifiPausedForHunt = true;
+        Serial.println("[DET] WiFi paused for hunt (100% BLE antenna)");
+    }
+}
+
+void DetectionEngine::stopHunt() {
+    _huntActive = false;
+    if (_bleBoosted) {
+        setBLEDuty(NORMAL_BLE_INTERVAL, NORMAL_BLE_WINDOW);
+        _bleBoosted = false;
+        Serial.println("[DET] BLE duty restored");
+    }
+    if (_wifiPausedForHunt) {
+        startWiFi();
+        _wifiPausedForHunt = false;
+        Serial.println("[DET] WiFi sniffer resumed");
+    }
+}
+
+int DetectionEngine::correlateRotation() {
+    uint32_t now = millis();
+    int best = -1;
+    int8_t bestRssi = -127;
+
+    for (int i = 0; i < MAX_DETECTIONS; i++) {
+        const Detection& d = _det[i];
+        if (!d.used || d.src != _huntSrc) continue;
+        if (memcmp(d.mac, _huntMac, 6) == 0) continue;
+        if (d.type != _huntType) continue;
+        if (now - d.lastSeen > HUNT_STALE_MS) continue;
+
+        int8_t r = d.rssiSmooth != -127 ? d.rssiSmooth : d.rssi;
+        int diff = abs((int)r - (int)_huntLastRssi);
+        if (diff > HUNT_RSSI_TOLERANCE) continue;
+
+        if (r > bestRssi) {
+            bestRssi = r;
+            best = i;
+        }
+    }
+    return best;
+}
+
+int DetectionEngine::findHuntTarget() {
+    if (!_huntActive) return -1;
+
+    int idx = find(_huntMac, _huntSrc);
+    uint32_t now = millis();
+
+    if (idx >= 0) {
+        Detection& d = _det[idx];
+        if (now - d.lastSeen < HUNT_STALE_MS) {
+            _huntLastRssi = d.rssiSmooth != -127 ? d.rssiSmooth : d.rssi;
+            return idx;
+        }
+    }
+
+    // Original MAC is stale — look for a rotated replacement
+    if (!isTrackerType(_huntType)) return idx >= 0 ? idx : -1;
+
+    int candidate = correlateRotation();
+    if (candidate >= 0) {
+        Detection& c = _det[candidate];
+        memcpy(_huntMac, c.mac, 6);
+        _huntLastRssi = c.rssiSmooth != -127 ? c.rssiSmooth : c.rssi;
+        _huntRotations++;
+        Serial.printf("[DET] Hunt target rotated MAC → %02X:%02X:%02X:%02X:%02X:%02X (#%lu)\n",
+                      c.mac[0], c.mac[1], c.mac[2], c.mac[3], c.mac[4], c.mac[5],
+                      (unsigned long)_huntRotations);
+        return candidate;
+    }
+
+    return idx >= 0 ? idx : -1;
+}
+
+// --- Stealth mode ---
+
+void DetectionEngine::setStealthMode(bool on) {
+    if (on == _stealthActive) return;
+    _stealthActive = on;
+
+    if (on) {
+        _preStealthBle = _bleRunning;
+        _preStealthWifi = _wifiRunning;
+        // Switch BLE to passive scan (no SCAN_REQ emissions)
+        if (_bleRunning) {
+            NimBLEScan* scan = NimBLEDevice::getScan();
+            scan->stop();
+            scan->setActiveScan(false);
+            scan->setInterval(NORMAL_BLE_INTERVAL);
+            scan->setWindow(NORMAL_BLE_WINDOW);
+            _bleRunning = scan->start(0, false, true);
+        }
+        // WiFi promiscuous is already passive; LoRa TX stopped by caller
+        Serial.println("[DET] Stealth mode ON: passive BLE, no TX");
+    } else {
+        // Restore active scan
+        if (_bleRunning) {
+            NimBLEScan* scan = NimBLEDevice::getScan();
+            scan->stop();
+            scan->setActiveScan(true);
+            scan->setInterval(NORMAL_BLE_INTERVAL);
+            scan->setWindow(NORMAL_BLE_WINDOW);
+            _bleRunning = scan->start(0, false, true);
+        }
+        if (_preStealthWifi && !_wifiRunning) startWiFi();
+        Serial.println("[DET] Stealth mode OFF: active scan restored");
+    }
 }
