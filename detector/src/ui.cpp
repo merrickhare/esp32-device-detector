@@ -116,21 +116,26 @@ int Display::selected() const {
 void Display::go(Screen s) {
     if (_screen == Screen::HUNT && s != Screen::HUNT) {
         detector.lockChannel(0);
-        detector.stopHunt();
+        if (_loraHuntActive)
+            _loraHuntActive = false;
+        else
+            detector.stopHunt();
     }
     if (_screen == Screen::DESKTOP && s != Screen::DESKTOP) freeDesktop();
     _screen = s;
 
     if (s == Screen::LIST) buildList();
     if (s == Screen::HUNT) {
-        memset(_hunt, -127, sizeof(_hunt));
-        _huntHead = _huntCount = 0;
+        _huntSampleHead = _huntSampleCount = 0;
         _huntLastSeen = 0;
-        int idx = selected();
-        if (idx >= 0) {
-            Detection* d = detector.at(idx);
-            if (d->src == Source::AP && d->channel) detector.lockChannel(d->channel);
-            detector.startHunt(d->mac, d->src);
+        _peakRssi = -127;
+        if (!_loraHuntActive) {
+            int idx = selected();
+            if (idx >= 0) {
+                Detection* d = detector.at(idx);
+                if (d->src == Source::AP && d->channel) detector.lockChannel(d->channel);
+                detector.startHunt(d->mac, d->src);
+            }
         }
     }
     redraw();
@@ -775,209 +780,266 @@ void Display::drawDetail(bool full) {
     }
 }
 
-static int16_t rssiToRadius(int8_t rssi) {
-    int clamped = constrain(rssi, RADAR_RSSI_MIN, RADAR_RSSI_MAX);
-    return RADAR_R - (int16_t)((clamped - RADAR_RSSI_MIN) * (long)RADAR_R /
-                               (RADAR_RSSI_MAX - RADAR_RSSI_MIN));
+void Display::startLoraHunt(uint32_t nodeId) {
+    _loraHuntNode = nodeId;
+    _loraHuntActive = true;
+    go(Screen::HUNT);
+}
+
+// Signal bar meter: 16 bars, short red (left/far) → tall green (right/close)
+#define HUNT_BARS      16
+#define BAR_W          12
+#define BAR_GAP         3
+#define BAR_BOTTOM    200
+#define BAR_MIN_H      12
+#define BAR_MAX_H     148
+#define BAR_X0        ((SCREEN_W - (HUNT_BARS * (BAR_W + BAR_GAP) - BAR_GAP)) / 2)
+
+static uint16_t barColor(int i) {
+    if (i < 4)  return C_HIGH;  // red
+    if (i < 8)  return C_MED;   // orange
+    if (i < 12) return C_LOW;   // yellow
+    return C_OK;                 // green
+}
+
+static int barHeight(int i) {
+    return BAR_MIN_H + (int)((long)i * (BAR_MAX_H - BAR_MIN_H) / (HUNT_BARS - 1));
 }
 
 void Display::drawHunt(bool full) {
     uint32_t now = millis();
-    int idx = detector.huntActive() ? detector.findHuntTarget() : selected();
-    if (detector.huntActive() && idx >= 0) {
-        Detection* d = detector.at(idx);
-        if (memcmp(d->mac, _selMac, 6) != 0) select(idx);
+    char buf[48];
+    int8_t rssi = -127;
+    uint32_t age = 0;
+    bool isLora = _loraHuntActive;
+    bool haveTarget = false;
+
+    int8_t rMin = isLora ? LORA_RSSI_MIN : BLE_RSSI_MIN;
+    int8_t rMax = isLora ? LORA_RSSI_MAX : BLE_RSSI_MAX;
+    uint32_t staleMs = isLora ? LORA_HUNT_STALE_MS : HUNT_STALE_MS;
+
+    // --- Resolve target ---
+    int idx = -1;
+    if (isLora) {
+        const LoraReport& lr = loraLink.latest();
+        for (int i = 0; i < lr.hitCount; i++) {
+            if (lr.hits[i].kind == HIT_MESHTASTIC && lr.hits[i].nodeId == _loraHuntNode) {
+                rssi = lr.hits[i].rssi < -126 ? -126 : lr.hits[i].rssi;
+                age = lr.hits[i].ageS * 1000UL;
+                haveTarget = true;
+                break;
+            }
+        }
+        if (!haveTarget && _huntSampleCount > 0) {
+            age = now - _huntSamples[(_huntSampleHead + HUNT_HISTORY_LEN - 1) % HUNT_HISTORY_LEN].ms;
+            haveTarget = true;
+        }
+    } else {
+        idx = detector.huntActive() ? detector.findHuntTarget() : selected();
+        if (detector.huntActive() && idx >= 0) {
+            Detection* d = detector.at(idx);
+            if (memcmp(d->mac, _selMac, 6) != 0) select(idx);
+        }
+        if (idx >= 0) {
+            const Detection& d = *detector.at(idx);
+            rssi = d.rssiSmooth != -127 ? d.rssiSmooth : d.rssi;
+            age = now - d.lastSeen;
+            haveTarget = true;
+        }
     }
+
+    bool lost = !haveTarget || age > staleMs;
+    uint16_t col = lost ? C_DIM : proximityColor(rssi);
+
     if (full) {
         _tft.fillScreen(C_BG);
         drawButton(Layout::HUNT_BACK);
+        _huntRssiShown = 999;
+        _huntTrendShown = -2;
     }
     drawStatusBar();
-    if (idx < 0) {
+
+    if (!haveTarget && _huntSampleCount == 0) {
         _tft.setTextDatum(MC_DATUM);
         _tft.setTextColor(C_MUTED, C_BG);
-        _tft.drawString("Device no longer tracked", 120, 140, 2);
+        _tft.drawString(isLora ? "Waiting for node..." : "Device no longer tracked", 120, 140, 2);
         _tft.setTextDatum(TL_DATUM);
         return;
     }
-    const Detection& d = *detector.at(idx);
-    char buf[48];
-    int8_t rssi = d.rssiSmooth != -127 ? d.rssiSmooth : d.rssi;
-    uint32_t age = now - d.lastSeen;
-    bool lost = age > 5000;
-    uint16_t col = lost ? C_DIM : proximityColor(rssi);
 
     // --- Header: name + live RSSI ---
-    if (full) {
-        _huntRssiShown = 999;
-        _huntTrendShown = -2;
-        _radarHead = _radarCount = 0;
-        _sweepAngle = 0;
-        _peakRssi = -127;
-        _peakRadius = RADAR_R;
-        memset(_radarTrail, -127, sizeof(_radarTrail));
+    if (isLora) {
+        snprintf(buf, sizeof(buf), "MESH !%08lx", (unsigned long)_loraHuntNode);
+    } else {
+        const Detection& d = *detector.at(idx);
+        labelFor(d, buf, sizeof(buf));
     }
-
-    labelFor(d, buf, sizeof(buf));
     fitText(_tft, buf, 160, 2);
     _tft.fillRect(0, 20, SCREEN_W, 14, C_BG);
     _tft.setTextDatum(TL_DATUM);
-    _tft.setTextColor(d.type != DetectionType::UNKNOWN ? colorFor(d) : C_ACCENT, C_BG);
+    if (isLora)
+        _tft.setTextColor(C_ACCENT, C_BG);
+    else if (idx >= 0 && detector.at(idx)->type != DetectionType::UNKNOWN)
+        _tft.setTextColor(colorFor(*detector.at(idx)), C_BG);
+    else
+        _tft.setTextColor(C_ACCENT, C_BG);
     _tft.drawString(buf, 6, 22, 2);
 
-    snprintf(buf, sizeof(buf), "%d dBm", rssi);
-    _tft.setTextDatum(TR_DATUM);
-    _tft.setTextColor(col, C_BG);
-    _tft.drawString(buf, SCREEN_W - 6, 22, 2);
-    _tft.setTextDatum(TL_DATUM);
+    if (rssi > -127) {
+        snprintf(buf, sizeof(buf), "%d dBm", rssi);
+        _tft.setTextDatum(TR_DATUM);
+        _tft.setTextColor(col, C_BG);
+        _tft.drawString(buf, SCREEN_W - 6, 22, 2);
+        _tft.setTextDatum(TL_DATUM);
+    }
 
-    // MAC line
-    fmtMac(d.mac, buf);
+    // Identity line
     _tft.fillRect(0, 36, SCREEN_W, 10, C_BG);
     _tft.setTextDatum(MC_DATUM);
     _tft.setTextColor(C_MUTED, C_BG);
+    if (isLora)
+        snprintf(buf, sizeof(buf), "LORA  via companion");
+    else
+        fmtMac(detector.at(idx)->mac, buf);
     _tft.drawString(buf, 120, 40, 1);
     _tft.setTextDatum(TL_DATUM);
 
     // --- Record sample ---
-    int8_t sample = (d.lastSeen != _huntLastSeen) ? rssi : -127;
-    _huntLastSeen = d.lastSeen;
-
-    if (sample != -127) {
-        _radarTrail[_radarHead] = sample;
-        _radarHead = (_radarHead + 1) % RADAR_TRAIL_LEN;
-        if (_radarCount < RADAR_TRAIL_LEN) _radarCount++;
-        if (sample > _peakRssi) {
-            _peakRssi = sample;
-            _peakRadius = rssiToRadius(sample);
+    if (rssi > -127) {
+        uint32_t heardAt = isLora ? (now - age) : (idx >= 0 ? detector.at(idx)->lastSeen : 0);
+        if (heardAt != _huntLastSeen) {
+            _huntSamples[_huntSampleHead] = {rssi, now};
+            _huntSampleHead = (_huntSampleHead + 1) % HUNT_HISTORY_LEN;
+            if (_huntSampleCount < HUNT_HISTORY_LEN) _huntSampleCount++;
+            _huntLastSeen = heardAt;
+            if (rssi > _peakRssi) _peakRssi = rssi;
         }
-        _sweepAngle += RADAR_SWEEP_DEG;
-        if (_sweepAngle >= 360.0f) _sweepAngle -= 360.0f;
     }
 
-    // Also feed the old trend buffer
-    _hunt[_huntHead] = sample;
-    _huntHead = (_huntHead + 1) % (uint8_t)sizeof(_hunt);
-    if (_huntCount < (uint8_t)sizeof(_hunt)) _huntCount++;
-
-    // --- Radar display ---
-    // Clear radar area
-    _tft.fillCircle(RADAR_CX, RADAR_CY, RADAR_R + 1, C_BG);
-
-    // Concentric rings
-    for (int i = 1; i <= RADAR_RINGS; i++) {
-        int r = i * RADAR_R / RADAR_RINGS;
-        _tft.drawCircle(RADAR_CX, RADAR_CY, r, C_DIM);
+    // --- Signal bar meter ---
+    // How many bars are active based on current RSSI
+    int activeBars = 0;
+    if (!lost && rssi > -127) {
+        int clamped = constrain(rssi, rMin, rMax);
+        activeBars = 1 + (int)((long)(clamped - rMin) * (HUNT_BARS - 1) / (rMax - rMin));
     }
-    // Crosshairs
-    _tft.drawFastHLine(RADAR_CX - RADAR_R, RADAR_CY, RADAR_R * 2, C_DIM);
-    _tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_R, RADAR_R * 2, C_DIM);
-
-    // Ring labels
-    _tft.setTextDatum(TL_DATUM);
-    _tft.setTextColor(C_MUTED, C_BG);
-    _tft.drawString("FAR", RADAR_CX + 2, RADAR_CY - RADAR_R + 2, 1);
-    _tft.drawString("CLOSE", RADAR_CX + 2, RADAR_CY - RADAR_R * 3 / 5 + 2, 1);
-
-    // Peak ring (dashed effect via dots)
+    // Peak bar count
+    int peakBars = 0;
     if (_peakRssi > -127) {
-        for (int a = 0; a < 360; a += 8) {
-            float rad = a * 3.14159f / 180.0f;
-            int px = RADAR_CX + (int)(_peakRadius * cosf(rad));
-            int py = RADAR_CY + (int)(_peakRadius * sinf(rad));
-            _tft.drawPixel(px, py, C_OK);
+        int clamped = constrain(_peakRssi, rMin, rMax);
+        peakBars = 1 + (int)((long)(clamped - rMin) * (HUNT_BARS - 1) / (rMax - rMin));
+    }
+
+    for (int i = 0; i < HUNT_BARS; i++) {
+        int bx = BAR_X0 + i * (BAR_W + BAR_GAP);
+        int bh = barHeight(i);
+        int by = BAR_BOTTOM - bh;
+        uint16_t bc = barColor(i);
+
+        // Clear the bar area
+        _tft.fillRect(bx, BAR_BOTTOM - BAR_MAX_H, BAR_W, BAR_MAX_H, C_BG);
+
+        if (i < activeBars) {
+            // Active: filled bar
+            _tft.fillRect(bx, by, BAR_W, bh, bc);
+        } else {
+            // Inactive: dim outline only
+            uint16_t dim = ((bc >> 2) & 0x39E7);
+            _tft.drawRect(bx, by, BAR_W, bh, dim);
+        }
+        // Peak marker: bright top line on the peak bar
+        if (i == peakBars - 1 && peakBars > activeBars) {
+            int ph = barHeight(i);
+            _tft.fillRect(bx, BAR_BOTTOM - ph, BAR_W, 2, C_OK);
         }
     }
 
-    // Trail dots: older = dimmer, newer = brighter
-    float angle = _sweepAngle;
-    for (int i = _radarCount - 1; i >= 0; i--) {
-        int idx2 = (_radarHead + RADAR_TRAIL_LEN - 1 - i) % RADAR_TRAIL_LEN;
-        int8_t s = _radarTrail[idx2];
-        if (s == -127) { angle -= RADAR_SWEEP_DEG; continue; }
-
-        int16_t r = rssiToRadius(s);
-        float rad = angle * 3.14159f / 180.0f;
-        int dx = RADAR_CX + (int)(r * cosf(rad));
-        int dy = RADAR_CY + (int)(r * sinf(rad));
-
-        float fade = (float)(_radarCount - 1 - i) / (float)_radarCount;
-        uint16_t dotCol;
-        if (fade > 0.7f)      dotCol = C_DIM;
-        else if (fade > 0.4f) dotCol = proximityColor(s) & 0x7BEF; // half brightness
-        else                  dotCol = proximityColor(s);
-
-        int dotR = (i < 3) ? 3 : 2;
-        _tft.fillCircle(dx, dy, dotR, dotCol);
-        angle -= RADAR_SWEEP_DEG;
-    }
-
-    // Current position: big bright dot
-    if (!lost && _radarCount > 0) {
-        int16_t r = rssiToRadius(rssi);
-        float rad = _sweepAngle * 3.14159f / 180.0f;
-        int cx = RADAR_CX + (int)(r * cosf(rad));
-        int cy = RADAR_CY + (int)(r * sinf(rad));
-        _tft.fillCircle(cx, cy, 5, col);
-        _tft.drawCircle(cx, cy, 6, C_FG);
-    }
-
-    // Sweep line (faint, from center to current dot position)
-    if (!lost) {
-        float rad = _sweepAngle * 3.14159f / 180.0f;
-        int ex = RADAR_CX + (int)(RADAR_R * cosf(rad));
-        int ey = RADAR_CY + (int)(RADAR_R * sinf(rad));
-        _tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, C_DIM);
-    }
-
-    // --- Proximity label + trend below radar ---
-    _tft.fillRect(0, RADAR_CY + RADAR_R + 4, SCREEN_W, 16, C_BG);
+    // --- Proximity label (large, below bars) ---
+    _tft.fillRect(0, 204, SCREEN_W, 18, C_BG);
     _tft.setTextDatum(MC_DATUM);
     _tft.setTextColor(col, C_BG);
-    _tft.drawString(lost ? "SIGNAL LOST" : proximityLabel(rssi),
-                    120, RADAR_CY + RADAR_R + 12, 2);
-
-    // Trend: last 6 heard samples vs the 6 before (more samples = smoother)
-    int recent = 0, older = 0, nr = 0, no2 = 0;
-    for (int i = 0; i < _huntCount && (nr < 6 || no2 < 6); i++) {
-        int8_t s = _hunt[(_huntHead + sizeof(_hunt) - 1 - i) % sizeof(_hunt)];
-        if (s == -127) continue;
-        if (nr < 6) { recent += s; nr++; }
-        else         { older += s; no2++; }
-    }
-    _tft.fillRect(0, RADAR_CY + RADAR_R + 20, SCREEN_W, 14, C_BG);
-    if (nr == 6 && no2 == 6) {
-        int diff = (recent - older) / 6;
-        const char* trendStr = diff >= 3 ? "GETTING CLOSER" : diff <= -3 ? "MOVING AWAY" : "STEADY";
-        uint16_t tc = diff >= 3 ? C_OK : diff <= -3 ? C_MED : C_MUTED;
-        _tft.setTextColor(tc, C_BG);
-        _tft.drawString(trendStr, 120, RADAR_CY + RADAR_R + 27, 2);
+    const char* proxLabel;
+    if (lost) {
+        char agoBuf[12];
+        if (_huntSampleCount > 0) {
+            uint32_t lastMs = _huntSamples[(_huntSampleHead + HUNT_HISTORY_LEN - 1) % HUNT_HISTORY_LEN].ms;
+            fmtAgo(now - lastMs, agoBuf, sizeof(agoBuf));
+            snprintf(buf, sizeof(buf), "LAST SEEN %s AGO", agoBuf);
+            proxLabel = buf;
+        } else {
+            proxLabel = "SIGNAL LOST";
+        }
     } else {
-        _tft.setTextColor(C_MUTED, C_BG);
-        _tft.drawString("walk around slowly...", 120, RADAR_CY + RADAR_R + 27, 2);
+        proxLabel = proximityLabel(rssi);
     }
-    _tft.setTextDatum(TL_DATUM);
+    _tft.drawString(proxLabel, 120, 212, 2);
+
+    // --- Trend (timestamp-based: recent N vs previous N) ---
+    _tft.fillRect(0, 224, SCREEN_W, 14, C_BG);
+    int trendN = HUNT_TREND_SAMPLES;
+    if (_huntSampleCount >= trendN * 2) {
+        int recent = 0, older = 0;
+        for (int i = 0; i < trendN; i++) {
+            int ri = (_huntSampleHead + HUNT_HISTORY_LEN - 1 - i) % HUNT_HISTORY_LEN;
+            int oi = (_huntSampleHead + HUNT_HISTORY_LEN - 1 - trendN - i) % HUNT_HISTORY_LEN;
+            recent += _huntSamples[ri].rssi;
+            older += _huntSamples[oi].rssi;
+        }
+        int diff = (recent - older) / trendN;
+        const char* trendStr;
+        uint16_t tc;
+        if (diff >= 3)       { trendStr = ">> GETTING CLOSER >>"; tc = C_OK; }
+        else if (diff <= -3) { trendStr = "<< MOVING AWAY <<";    tc = C_MED; }
+        else                 { trendStr = "- STEADY -";           tc = C_MUTED; }
+        _tft.setTextColor(tc, C_BG);
+        _tft.drawString(trendStr, 120, 230, 2);
+    } else if (_huntSampleCount > 0) {
+        _tft.setTextColor(C_MUTED, C_BG);
+        _tft.drawString("walk around slowly...", 120, 230, 2);
+    }
+
+    // --- Signal history (last 24 readings as thin bars) ---
+    const int histY = 244, histH = 14;
+    int histW = 8, histGap = 2;
+    int histTotalW = HUNT_HISTORY_LEN * (histW + histGap) - histGap;
+    int histX0 = (SCREEN_W - histTotalW) / 2;
+    _tft.fillRect(histX0 - 1, histY, histTotalW + 2, histH + 1, C_BG);
+    _tft.drawFastHLine(histX0, histY + histH, histTotalW, C_DIM);
+    for (int i = 0; i < _huntSampleCount; i++) {
+        int si = (_huntSampleHead + HUNT_HISTORY_LEN - _huntSampleCount + i) % HUNT_HISTORY_LEN;
+        int8_t s = _huntSamples[si].rssi;
+        int clamped = constrain(s, rMin, rMax);
+        int h = 1 + (int)((clamped - rMin) * (long)(histH - 1) / (rMax - rMin));
+        int hx = histX0 + i * (histW + histGap);
+        _tft.fillRect(hx, histY + histH - h, histW, h, proximityColor(s));
+    }
 
     // --- Status line ---
+    _tft.fillRect(0, 262, SCREEN_W, 10, C_BG);
     char ago2[12];
     fmtAgo(age, ago2, sizeof(ago2));
-    if (_peakRssi > -127)
-        snprintf(buf, sizeof(buf), "peak %ddBm  %s  %s ago  x%u",
-                 _peakRssi, sourceName(d.src), ago2, d.hits);
-    else
-        snprintf(buf, sizeof(buf), "%s  %s ago  x%u", sourceName(d.src), ago2, d.hits);
-    if (detector.huntActive() && detector.huntRotations() > 0) {
-        char rot[16];
-        snprintf(rot, sizeof(rot), "  rot:%lu", (unsigned long)detector.huntRotations());
-        strlcat(buf, rot, sizeof(buf));
+    if (isLora) {
+        if (_peakRssi > -127)
+            snprintf(buf, sizeof(buf), "peak %ddBm  LORA  %s ago", _peakRssi, ago2);
+        else
+            snprintf(buf, sizeof(buf), "LORA  %s ago", ago2);
+    } else {
+        const Detection& d = *detector.at(idx);
+        if (_peakRssi > -127)
+            snprintf(buf, sizeof(buf), "peak %ddBm  %s  %s ago  x%u",
+                     _peakRssi, sourceName(d.src), ago2, d.hits);
+        else
+            snprintf(buf, sizeof(buf), "%s  %s ago  x%u", sourceName(d.src), ago2, d.hits);
+        if (detector.huntActive() && detector.huntRotations() > 0) {
+            char rot[16];
+            snprintf(rot, sizeof(rot), "  rot:%lu", (unsigned long)detector.huntRotations());
+            strlcat(buf, rot, sizeof(buf));
+        }
     }
-    char line[40];
-    int len = strlen(buf);
-    if (len > 38) len = 38;
-    int pad = (38 - len) / 2;
-    snprintf(line, sizeof(line), "%*s%.*s%*s", pad, "", len, buf, 38 - len - pad, "");
+    _tft.setTextDatum(MC_DATUM);
     _tft.setTextColor(C_MUTED, C_BG);
-    _tft.drawString(line, 6, 268, 1);
+    _tft.drawString(buf, 120, 266, 1);
+    _tft.setTextDatum(TL_DATUM);
 }
 
 void Display::drawSettings(bool full) {
@@ -1023,7 +1085,7 @@ void Display::drawSettings(bool full) {
     for (int i = 0; i < 2; i++) {
         snprintf(buf, sizeof(buf), "%-38.38s", lines[i]);
         _tft.setTextColor(C_MUTED, C_BG);
-        _tft.drawString(buf, 6, 278 + i * 9, 1);
+        _tft.drawString(buf, 6, 250 + i * 12, 1);
     }
 }
 
@@ -1148,7 +1210,7 @@ void Display::drawLora(bool full) {
         }
     }
 
-    // Recent hits
+    // Recent hits (Meshtastic rows are tappable → hunt)
     for (int i = 0; i < 5; i++) {
         int y = 216 + i * 12;
         if (i >= r.hitCount) {
@@ -1157,13 +1219,19 @@ void Display::drawLora(bool full) {
         }
         const LoraHit& h = r.hits[i];
         fmtAgo(h.ageS * 1000UL, ago, sizeof(ago));
-        if (h.kind == HIT_MESHTASTIC)
-            snprintf(buf, sizeof(buf), "MESH !%08lx %4ddBm snr%3d %s",
-                     (unsigned long)h.nodeId, h.rssi, h.snr, ago);
-        else
+        if (h.kind == HIT_MESHTASTIC) {
+            snprintf(buf, sizeof(buf), "MESH !%08lx %ddBm %s",
+                     (unsigned long)h.nodeId, h.rssi, ago);
+            padLine(_tft, buf, y, h.ageS < 60 ? C_FG : C_MUTED);
+            _tft.setTextDatum(TR_DATUM);
+            _tft.setTextColor(C_ACCENT, C_BG);
+            _tft.drawString("HUNT>", SCREEN_W - 2, y, 1);
+            _tft.setTextDatum(TL_DATUM);
+        } else {
             snprintf(buf, sizeof(buf), "LoRa %.3f SF%u %4ddBm %s",
                      h.freqKhz / 1000.0f, h.sf, h.rssi, ago);
-        padLine(_tft, buf, y, h.ageS < 60 ? C_FG : C_MUTED);
+            padLine(_tft, buf, y, h.ageS < 60 ? C_FG : C_MUTED);
+        }
     }
 }
 

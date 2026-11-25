@@ -237,7 +237,17 @@ static void touchHome(int16_t x, int16_t y) {
 }
 
 static void touchLora(int16_t x, int16_t y) {
-    if (Display::hit(Layout::LORA_BACK, x, y)) ui.go(Screen::HOME);
+    if (Display::hit(Layout::LORA_BACK, x, y)) { ui.go(Screen::HOME); return; }
+
+    // Tap on a Meshtastic hit row → start LoRa hunt
+    const int hitY0 = 216, hitRowH = 12;
+    if (y >= hitY0 && y < hitY0 + 5 * hitRowH && loraLink.online()) {
+        int row = (y - hitY0) / hitRowH;
+        const LoraReport& r = loraLink.latest();
+        if (row < r.hitCount && r.hits[row].kind == HIT_MESHTASTIC && r.hits[row].nodeId) {
+            ui.startLoraHunt(r.hits[row].nodeId);
+        }
+    }
 }
 
 static void touchList(int16_t x, int16_t y) {
@@ -270,7 +280,8 @@ static void touchDetail(int16_t x, int16_t y) {
 }
 
 static void touchHunt(int16_t x, int16_t y) {
-    if (Display::hit(Layout::HUNT_BACK, x, y)) ui.go(Screen::DETAIL);
+    if (Display::hit(Layout::HUNT_BACK, x, y))
+        ui.go(ui.loraHuntActive() ? Screen::LORA : Screen::DETAIL);
 }
 
 static void touchSettings(int16_t x, int16_t y) {

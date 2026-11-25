@@ -4,11 +4,54 @@
 SDLogger sdLog;
 
 bool SDLogger::init() {
-    SPI.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SD_CS);
-    if (!SD.begin(PIN_SD_CS)) {
-        Serial.println("[SD] Card mount failed");
-        return false;
+    // Deselect both chips
+    pinMode(PIN_TFT_CS, OUTPUT);
+    digitalWrite(PIN_TFT_CS, HIGH);
+    pinMode(PIN_SD_CS, OUTPUT);
+    digitalWrite(PIN_SD_CS, HIGH);
+
+    // Raw GPIO read BEFORE SPI init — checks the pull-up at electrical level
+    pinMode(PIN_SPI_MISO, INPUT);
+    delay(5);
+    int raw = digitalRead(PIN_SPI_MISO);
+    Serial.printf("[SD] Raw GPIO %d read: %s\n", PIN_SPI_MISO, raw ? "HIGH (pull-up OK)" : "LOW (line held down)");
+
+    // Init the global SPI instance
+    SPI.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI);
+
+    Serial.printf("[SD] CS=%d  CLK=%d MISO=%d MOSI=%d\n",
+                  PIN_SD_CS, PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI);
+
+    // SPI probe: read MISO with all CS high, then with SD selected
+    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+    uint8_t idle = SPI.transfer(0xFF);
+    SPI.endTransaction();
+    Serial.printf("[SD] SPI idle (all CS high): 0x%02X\n", idle);
+
+    // 80+ clocks with CS high (SD spec init requirement)
+    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+    for (int i = 0; i < 10; i++) SPI.transfer(0xFF);
+    SPI.endTransaction();
+
+    digitalWrite(PIN_SD_CS, LOW);
+    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+    uint8_t sel = SPI.transfer(0xFF);
+    SPI.endTransaction();
+    digitalWrite(PIN_SD_CS, HIGH);
+    Serial.printf("[SD] SPI with SD selected: 0x%02X\n", sel);
+
+    // Try mount — slow clock first
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint32_t freq = (attempt == 0) ? 400000 : 4000000;
+        if (SD.begin(PIN_SD_CS, SPI, freq)) goto mounted;
+        Serial.printf("[SD] Attempt %d failed (freq %lu)\n", attempt + 1, (unsigned long)freq);
+        SD.end();
+        delay(200);
     }
+    Serial.println("[SD] Card mount failed after 3 attempts");
+    return false;
+
+mounted:
     Serial.printf("[SD] Card mounted. Size: %lluMB\n", SD.cardSize() / (1024 * 1024));
     if (!SD.exists("/logs")) SD.mkdir("/logs");
 

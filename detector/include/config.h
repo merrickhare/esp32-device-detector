@@ -17,7 +17,9 @@
 #define PIN_TOUCH_XM  25
 #define PIN_TOUCH_YM  26
 
-#define PIN_SD_CS      5
+#ifndef PIN_SD_CS
+#define PIN_SD_CS      5   // override in local_config.h if your board differs
+#endif
 
 // --- Display ---
 #define SCREEN_W  240
@@ -56,15 +58,14 @@
 #define RSSI_EMA_ALPHA        0.3f // smoothing factor (0–1, lower = smoother)
 #define HUNT_PAUSE_WIFI     true  // pause WiFi sniffer during hunt for 100% BLE antenna
 
-// --- Radar display ---
-#define RADAR_CX            120
-#define RADAR_CY            146
-#define RADAR_R              88
-#define RADAR_RINGS            5
-#define RADAR_TRAIL_LEN       36   // samples in sweep trail
-#define RADAR_RSSI_MIN     -100   // outer edge
-#define RADAR_RSSI_MAX      -35   // center
-#define RADAR_SWEEP_DEG       10   // degrees per sample
+// --- Hunt display ---
+#define HUNT_HISTORY_LEN      24   // timestamped RSSI samples for trend + history
+#define BLE_RSSI_MIN       -100   // outer edge (BLE/WiFi)
+#define BLE_RSSI_MAX        -35   // center     (BLE/WiFi)
+#define LORA_RSSI_MIN      -130   // outer edge (LoRa)
+#define LORA_RSSI_MAX       -60   // center     (LoRa)
+#define HUNT_TREND_SAMPLES     4   // compare N recent vs N older for trend
+#define LORA_HUNT_STALE_MS 30000   // LoRa samples come slowly
 
 // --- False positive filter ---
 #define AIRTAG_RATE_MIN     0.15f  // min hits/sec for real AirTag

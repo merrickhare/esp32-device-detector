@@ -59,17 +59,17 @@ namespace Layout {
 
     static const Button HUNT_BACK  = {0, 280, 240, 36, "< BACK", C_BTN};
 
-    static const Button SET_BLE    = {6, 48, 111, 38, nullptr, C_BTN};
-    static const Button SET_WIFI   = {123, 48, 111, 38, nullptr, C_BTN};
-    static const Button SET_DIM    = {6, 92, 111, 38, "BRIGHT -", C_BTN};
-    static const Button SET_BRIGHT = {123, 92, 111, 38, "BRIGHT +", C_BTN};
-    static const Button SET_POPUP  = {6, 136, 111, 38, nullptr, C_BTN};
-    static const Button SET_CAL    = {123, 136, 111, 38, "CALIBRATE", C_BTN};
-    static const Button SET_UNIGN  = {6, 180, 111, 34, "UN-IGNORE", C_BTN};
-    static const Button SET_CLEAR  = {123, 180, 111, 34, "CLEAR ALL", C_BTN};
-    static const Button SET_STEALTH = {6, 218, 111, 30, nullptr, C_BTN};
-    static const Button SET_PCAP   = {123, 218, 111, 30, nullptr, C_BTN};
-    static const Button SET_NET    = {6, 252, 228, 24, "WIFI SETUP (DESKTOP)", C_NAVY};
+    static const Button SET_BLE    = {6, 44, 111, 32, nullptr, C_BTN};
+    static const Button SET_WIFI   = {123, 44, 111, 32, nullptr, C_BTN};
+    static const Button SET_DIM    = {6, 80, 111, 32, "BRIGHT -", C_BTN};
+    static const Button SET_BRIGHT = {123, 80, 111, 32, "BRIGHT +", C_BTN};
+    static const Button SET_POPUP  = {6, 116, 111, 32, nullptr, C_BTN};
+    static const Button SET_CAL    = {123, 116, 111, 32, "CALIBRATE", C_BTN};
+    static const Button SET_UNIGN  = {6, 152, 111, 30, "UN-IGNORE", C_BTN};
+    static const Button SET_CLEAR  = {123, 152, 111, 30, "CLEAR ALL", C_BTN};
+    static const Button SET_STEALTH = {6, 186, 111, 30, nullptr, C_BTN};
+    static const Button SET_PCAP   = {123, 186, 111, 30, nullptr, C_BTN};
+    static const Button SET_NET    = {6, 220, 228, 24, "WIFI SETUP (DESKTOP)", C_NAVY};
     static const Button PORTAL_CANCEL = {0, 280, 240, 36, "CANCEL", C_BTN};
 
     static const Button LORA_BACK  = {0, 280, 240, 36, "< BACK", C_BTN};
@@ -98,6 +98,10 @@ public:
     void showCalTarget(int16_t x, int16_t y, int step, int total);
     void showMessage(const char* line1, const char* line2, uint16_t color);
     void showPortal(const char* apPass);
+
+    // LoRa hunt: track a Meshtastic node by ID
+    void startLoraHunt(uint32_t nodeId);
+    bool loraHuntActive() const { return _loraHuntActive; }
 
     static bool hit(const Button& b, int16_t x, int16_t y);
 
@@ -142,15 +146,16 @@ private:
     Source _selSrc = Source::BLE;
     bool _selValid = false;
 
-    // Hunt history + radar trail
-    int8_t _hunt[55];
-    uint8_t _huntHead = 0, _huntCount = 0;
+    // Hunt history (timestamped samples for trend + history bars)
+    struct HuntSample { int8_t rssi; uint32_t ms; };
+    HuntSample _huntSamples[HUNT_HISTORY_LEN];
+    uint8_t _huntSampleHead = 0, _huntSampleCount = 0;
     uint32_t _huntLastSeen = 0;
-    int8_t _radarTrail[RADAR_TRAIL_LEN];
-    uint8_t _radarHead = 0, _radarCount = 0;
-    float _sweepAngle = 0;
     int8_t _peakRssi = -127;
-    int16_t _peakRadius = RADAR_R;
+
+    // LoRa hunt (track a Meshtastic node by ID)
+    uint32_t _loraHuntNode = 0;
+    bool _loraHuntActive = false;
 
     // Battery
     uint32_t _battReadMs = 0;
